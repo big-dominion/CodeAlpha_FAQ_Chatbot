@@ -1,0 +1,22 @@
+[project]
+name = "codealpha-faq-chatbot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "deep-translator>=1.11.4",
+    "fastapi>=0.141.1",
+    "groq>=1.6.0",
+    "gtts>=2.5.4",
+    "imageio-ffmpeg>=0.6.0",
+    "pinecone>=9.1.0",
+    "pydantic>=2.13.4",
+    "pydub>=0.25.1",
+    "pypdf>=6.16.1",
+    "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.32",
+    "slowapi>=0.1.10",
+    "speechrecognition>=3.17.0",
+    "uvicorn>=0.52.4",
+]

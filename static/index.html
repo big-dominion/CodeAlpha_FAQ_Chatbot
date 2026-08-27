@@ -1,0 +1,1823 @@
+<!DOCTYPE html>
+<!--
+  DOMINION LexOracle : CodeAlpha AI Edition - Frontend
+  ----------------------------------------------------
+
+  WIRING MAP (read this first - it's the fastest way to trace how a click
+  on screen turns into a request to main.py and back):
+
+  1. TWO "SCREENS", ONE PAGE
+     There's no routing here - #welcome-screen and #workspace-screen are
+     both always in the DOM. "Navigating" just toggles which one has the
+     `hidden` class (see goToWorkspace() / goToWelcome() in the main
+     <script> block). #enter-workspace-btn, #back-to-welcome,
+     #header-home-btn, and #return-home-btn are the four buttons wired to
+     those two functions.
+
+  2. SENDING A MESSAGE (text)
+     #chat-input + #send-btn -> sendMessage() -> POST /api/v1/chat
+     (a FastAPI route in main.py, see chat_endpoint there). The response
+     JSON's `response_text` (translated) and `raw_answer` (always English)
+     are both handed to addAssistantBubble(), which renders one with
+     Markdown and stashes the other in a data-attribute for later reuse
+     by Listen/re-translate.
+
+  3. SENDING A MESSAGE (voice)
+     #mic-btn starts/stops a MediaRecorder -> on stop, the recorded blob
+     is previewed via #voice-preview-bar (play/cancel/send buttons) ->
+     #voice-preview-send -> sendAudioMessage() -> POST /api/v1/chat as
+     multipart form data with an `audio_file` field this time instead of
+     `text_input`. main.py's chat_endpoint runs it through
+     services/audio_handler.py's speech_to_text_from_bytes() before doing
+     anything else - the frontend never transcribes locally.
+
+  4. LANGUAGE SWITCHING
+     #lang-btn opens #lang-dropdown; each .lang-option click sets
+     #lang-current's text (this text IS the `target_lang` value sent on
+     every future /api/v1/chat, /api/v1/tts, and /api/v1/translate call -
+     there's no separate language code stored anywhere in the frontend)
+     and calls lockAndRetranslate(), which calls retranslateAllBubbles()
+     for every existing answer bubble via POST /api/v1/translate
+     (text-only, no audio - see main.py's translate_endpoint). The
+     #lang-lock-indicator / disabled dropdown state exists so a second
+     language pick can't fire while the first batch of translate calls is
+     still in flight - see the long comment near isTranslating further
+     down in the script for why that race actually mattered in practice.
+
+  5. LISTEN / AUDIO PLAYBACK
+     Each assistant bubble's .listen-btn carries the ORIGINAL raw English
+     answer in its `data-raw-answer` attribute (URL-encoded). Clicking it
+     runs playAudio(), which fires TWO parallel requests for whatever
+     language is currently selected:
+       - POST /api/v1/translate  (Markdown-intact text, for on-screen display)
+       - POST /api/v1/tts        (Markdown-STRIPPED text, for gTTS - see
+         stripMarkdownForSpeech(); main.py's tts_endpoint calls
+         services/audio_handler.py's text_to_speech_base64())
+     The tts response's own display_text is deliberately ignored - only
+     its audio_base64 is used - specifically to avoid re-flattening the
+     Markdown that the translate call just rendered. Playback state
+     (which language's audio is cached, and the play/pause toggle) is
+     stashed directly on the button element via `btn._audioEl` /
+     `btn._audioLang` / `btn.dataset.playing`.
+
+  6. CITATIONS
+     Each citation returned in a /api/v1/chat response becomes both a
+     clickable pill (citationPillHTML()) AND an entry in the
+     `dynamicCitationData` lookup table, keyed by the citation's `key`.
+     Clicking a pill calls openSheet(key), which reads that same lookup
+     table and populates the #bottom-sheet (title/section/match/body
+     text) - this sheet is NOT re-fetched from the backend; it's built
+     entirely from data already present in the original chat response.
+     #open-statute-btn opens a URL looked up from `actSourceUrls`, which
+     is loaded once at page load from /static/source-links.json (a static
+     file, not a FastAPI route).
+
+  7. DOC FILTER CHIPS
+     The row of .filter-chip buttons (All / Constitution / CAMA / ...)
+     only filters which bubbles are VISIBLE in the already-rendered chat
+     log (applyFilter() toggles each row's display style client-side) -
+     but whichever chip is `.active` is ALSO read by sendMessage() /
+     sendAudioMessage() and sent as `doc_filter` on the next
+     /api/v1/chat call, which main.py passes straight through to
+     services/rag.py's query_lex_oracle() to restrict Pinecone retrieval
+     to one specific Act.
+
+  8. MARKDOWN RENDERING
+     The LLM's answers (and PDF-extracted citation text) arrive as real
+     Markdown, per services/rag.py's system prompt. renderMarkdown() runs
+     it through `marked` (parser) then `DOMPurify` (sanitizer) before ever
+     using innerHTML, since this text originates from an LLM (and from
+     extracted PDF text) that should never be trusted to inject raw
+     HTML/script. stripMarkdownForSpeech() is the separate, regex-based
+     text path used ONLY when preparing text for gTTS, so headers/pipes/
+     asterisks aren't read aloud literally.
+
+  Nothing in this file talks to Pinecone, Groq, or Google Translate
+  directly - every one of those integrations lives behind the three
+  FastAPI routes in main.py (/api/v1/chat, /api/v1/tts,
+  /api/v1/translate), which is the complete list of backend endpoints
+  this page ever calls.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>DOMINION LexOracle : CodeAlpha AI Edition</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          brass: {
+            400: '#D8C09A',
+            500: '#C9A876',
+            600: '#A6824F'
+          }
+        }
+      }
+    }
+  }
+</script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<!-- ADDED: Markdown renderer + sanitizer, so the LLM's real Markdown
+     (headers, tables, bold, bullets, horizontal rules) can be rendered
+     as actual styled HTML instead of shown as literal characters. -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* Theme tokens (CSS custom properties) used throughout the styles
+     below - the single source of truth for the app's gold/purple/slate
+     color palette, referenced by var(--name) rather than repeated hex
+     values. */
+  :root{
+    --slate-950:#0F172A;
+    --slate-800:#1E293B;
+    --gold:#C9A876;
+    --gold-deep:#A6824F;
+    --purple:#8B5CF6;
+    --parchment:#F8FAFC;
+    --silver:#94A3B8;
+  }
+  html,body{
+    background:var(--slate-950);
+    color:var(--parchment);
+    font-family:'Inter',sans-serif;
+    overscroll-behavior:none;
+  }
+  .font-display{font-family:'Spectral',serif;}
+  .font-mono{font-family:'JetBrains Mono',monospace;}
+
+  /* Full-viewport background canvas the particle-network animation
+     (see the IIFE near the top of the main <script> block below) draws
+     into. Sits at z-index:0, behind both #welcome-screen and
+     #workspace-screen. */
+  #particle-canvas{position:fixed;inset:0;width:100%;height:100%;z-index:0;}
+
+  .glass-panel{
+    background:linear-gradient(180deg, rgba(30,41,59,0.72) 0%, rgba(15,23,42,0.82) 100%);
+    border:1px solid rgba(139,92,246,0.22);
+    backdrop-filter:blur(14px);
+  }
+  .glow-border-gold{
+    border:1px solid rgba(198,168,118,0.35);
+    box-shadow:0 0 0 1px rgba(198,168,118,0.06) inset, 0 8px 32px -12px rgba(198,168,118,0.18);
+  }
+  .glow-border-purple{
+    border:1px solid rgba(139,92,246,0.28);
+    box-shadow:0 0 0 1px rgba(139,92,246,0.06) inset, 0 8px 32px -12px rgba(139,92,246,0.25);
+  }
+  .text-silver{color:var(--silver);}
+  .text-gold{color:var(--gold);}
+  .text-purple-accent{color:var(--purple);}
+
+  .badge-codealpha{
+    background:linear-gradient(90deg, rgba(139,92,246,0.16), rgba(198,168,118,0.14));
+    border:1px solid rgba(139,92,246,0.4);
+  }
+
+  .btn-primary{
+    background:linear-gradient(90deg, var(--gold-deep), var(--gold));
+    box-shadow:0 0 24px -4px rgba(198,168,118,0.55), 0 0 0 1px rgba(198,168,118,0.3) inset;
+    transition:transform .18s ease, box-shadow .18s ease, filter .18s ease;
+  }
+  .btn-primary:hover{transform:translateY(-1px);box-shadow:0 0 34px -2px rgba(198,168,118,0.75), 0 0 0 1px rgba(198,168,118,0.4) inset;filter:brightness(1.05);}
+  .btn-primary:active{transform:translateY(0);}
+  .btn-primary:focus-visible{outline:2px solid var(--gold);outline-offset:3px;}
+
+  .feature-card{
+    transition:transform .3s cubic-bezier(.16,1,.3,1), border-color .3s ease;
+    will-change:transform;
+  }
+  .feature-card:hover{
+    transform:translateY(-9px) scale(1.02);
+    border-color:rgba(198,168,118,0.5);
+  }
+  .feature-card:active{
+    transform:translateY(-3px) scale(1.005);
+    transition:transform .12s ease;
+  }
+
+  .seal-ring{
+    animation:spin-slow 22s linear infinite;
+  }
+  @keyframes spin-slow{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}
+
+  /* Cross-fade used by goToWorkspace()/goToWelcome() in the script below
+     when toggling which of the two top-level screens is visible. */
+  .fade-screen{transition:opacity .55s ease, transform .55s ease;}
+  .fade-out{opacity:0;transform:scale(0.985);pointer-events:none;}
+  .fade-in-up{animation:fadeInUp .5s ease both;}
+  @keyframes fadeInUp{from{opacity:0;transform:translateY(14px);}to{opacity:1;transform:translateY(0);}}
+
+  /* The small pulsing colored dots in the header's "Engine: Active /
+     Pinecone: Connected / TTS: In-Memory" status row - purely decorative
+     (static labels, not wired to any live health check). */
+  .status-dot{width:7px;height:7px;border-radius:9999px;position:relative;}
+  .status-dot::after{
+    content:'';position:absolute;inset:-4px;border-radius:9999px;
+    background:inherit;opacity:.45;animation:pulse-ring 1.8s ease-out infinite;
+  }
+  @keyframes pulse-ring{0%{transform:scale(0.6);opacity:.5;}100%{transform:scale(1.9);opacity:0;}}
+
+  /* Styling for the .filter-chip doc-filter buttons - see applyFilter()
+     and the `activeFilter`/`doc_filter` wiring described in the top-of-
+     file wiring map (#7). */
+  .filter-chip{
+    transition:background .2s ease, border-color .2s ease, color .2s ease, transform .15s ease;
+  }
+  .filter-chip:active{transform:scale(0.97);}
+  .filter-chip.active{
+    background:linear-gradient(90deg, rgba(166,130,79,0.9), rgba(198,168,118,0.9));
+    color:#1a1206;
+    border-color:transparent;
+    box-shadow:0 4px 16px -4px rgba(198,168,118,0.5);
+  }
+
+  .bubble-user{
+    background:linear-gradient(135deg, rgba(139,92,246,0.18), rgba(139,92,246,0.06));
+    border:1px solid rgba(139,92,246,0.3);
+  }
+  .bubble-assistant{
+    background:linear-gradient(135deg, rgba(30,41,59,0.9), rgba(15,23,42,0.9));
+    border:1px solid rgba(198,168,118,0.18);
+  }
+
+  /* The clickable citation pills built by citationPillHTML() - clicking
+     one calls openSheet(key), see wiring map #6. */
+  .citation-pill{
+    transition:background .18s ease, border-color .18s ease, transform .12s ease;
+  }
+  .citation-pill:hover{background:rgba(198,168,118,0.18);border-color:rgba(198,168,118,0.55);transform:translateY(-1px);}
+  .citation-pill:focus-visible{outline:2px solid var(--gold);outline-offset:2px;}
+
+  /* The slide-up citation detail panel (#bottom-sheet /
+     #bottom-sheet-backdrop) - opened/closed via openSheet()/closeSheet(). */
+  #bottom-sheet-backdrop{transition:opacity .3s ease;}
+  #bottom-sheet{transition:transform .38s cubic-bezier(.16,1,.3,1);}
+
+  /* The three bouncing dots shown by showTyping() while waiting for the
+     /api/v1/chat response. */
+  .typing-dot{animation:typing-bounce 1.2s infinite ease-in-out;}
+  .typing-dot:nth-child(2){animation-delay:.15s;}
+  .typing-dot:nth-child(3){animation-delay:.3s;}
+  @keyframes typing-bounce{0%,60%,100%{transform:translateY(0);opacity:.5;}30%{transform:translateY(-4px);opacity:1;}}
+
+  /* Applied to #mic-btn while a MediaRecorder is actively recording (see
+     the mic-btn click handler in the script below). */
+  .mic-recording{
+    box-shadow:0 0 0 0 rgba(239,68,68,0.6);
+    animation:mic-pulse 1.4s infinite;
+  }
+  @keyframes mic-pulse{
+    0%{box-shadow:0 0 0 0 rgba(239,68,68,0.55);}
+    70%{box-shadow:0 0 0 14px rgba(239,68,68,0);}
+    100%{box-shadow:0 0 0 0 rgba(239,68,68,0);}
+  }
+
+  .scrollbar-thin::-webkit-scrollbar{width:6px;height:6px;}
+  .scrollbar-thin::-webkit-scrollbar-thumb{background:rgba(139,92,246,0.35);border-radius:9999px;}
+  .scrollbar-thin::-webkit-scrollbar-track{background:transparent;}
+
+  /* Shared open/close animation base for both #lang-dropdown and
+     #settings-dropdown (each toggled by its own handler further down in
+     the script - see wiring map #4 for the language one specifically). */
+  .lang-dropdown{
+    transition:opacity .18s ease, transform .18s ease;
+    transform-origin:top right;
+  }
+
+  @media (prefers-reduced-motion: reduce){
+    *{animation-duration:0.001ms !important; animation-iteration-count:1 !important; transition-duration:0.001ms !important;}
+  }
+
+  [data-lucide]{ display:inline-block; }
+  /* Loading-state shimmer utility - defined here but not currently
+     applied to any element below; kept available for future loading
+     states. */
+  .skeleton-shimmer{
+    background:linear-gradient(90deg, rgba(148,163,184,0.08) 25%, rgba(148,163,184,0.18) 37%, rgba(148,163,184,0.08) 63%);
+    background-size:400% 100%;
+    animation:shimmer 1.4s ease infinite;
+  }
+  @keyframes shimmer{0%{background-position:100% 50%;}100%{background-position:0 50%;}}
+
+  /* #chat-input's auto-growing textarea behavior - actual height is set
+     inline by resizeChatInput() in the script below; this just defines
+     the box model and the "is-maxed" scrollable state it switches into
+     once the height cap is hit. */
+  .chat-input-box{
+    box-sizing:border-box;
+    resize:none;
+    overflow-y:hidden;
+    line-height:1.4;
+    min-height:1.4em;
+  }
+  .chat-input-box.is-maxed{
+    overflow-y:auto;
+  }
+
+  /* ADDED: styling for rendered Markdown inside answer bubbles and the
+     citation sheet, matched to the existing gold/parchment/purple theme. */
+  .markdown-body h1, .markdown-body h2, .markdown-body h3{
+    font-family:'Spectral',serif;
+    color:var(--gold);
+    font-weight:600;
+    margin-top:0.9em;
+    margin-bottom:0.4em;
+  }
+  .markdown-body h1{font-size:1.15rem;}
+  .markdown-body h2{font-size:1.05rem;}
+  .markdown-body h3{font-size:0.95rem;}
+  .markdown-body p{margin-bottom:0.6em;}
+  .markdown-body p:last-child{margin-bottom:0;}
+  .markdown-body strong{color:var(--parchment);font-weight:700;}
+  .markdown-body ul, .markdown-body ol{
+    padding-left:1.25em;
+    margin-bottom:0.6em;
+  }
+  .markdown-body ul{list-style-type:disc;}
+  .markdown-body ol{list-style-type:decimal;}
+  .markdown-body li{margin-bottom:0.25em;}
+  .markdown-body hr{
+    border:none;
+    border-top:1px solid rgba(198,168,118,0.25);
+    margin:0.9em 0;
+  }
+  .markdown-body table{
+      border-collapse:collapse;
+      table-layout:fixed;
+      width:100%;
+      margin-bottom:0.8em;
+      font-size:0.85em;
+  }
+  .markdown-body td, .markdown-body th{
+      word-wrap:break-word;
+      overflow-wrap:break-word;
+  }
+  .markdown-body th, .markdown-body td{
+    border:1px solid rgba(255,255,255,0.1);
+    padding:0.4em 0.6em;
+    text-align:left;
+  }
+  .markdown-body th{
+    background:rgba(198,168,118,0.1);
+    color:var(--gold);
+    font-weight:600;
+  }
+  .markdown-body code{
+    font-family:'JetBrains Mono',monospace;
+    background:rgba(148,163,184,0.12);
+    padding:0.1em 0.35em;
+    border-radius:4px;
+    font-size:0.85em;
+  }
+</style>
+</head>
+<body class="min-h-screen relative">
+
+<canvas id="particle-canvas" aria-hidden="true"></canvas>
+
+<!-- -------------- WELCOME SCREEN ------------ -->
+<!-- Landing/splash screen. #enter-workspace-btn below is the sole way
+     into #workspace-screen - wired to goToWorkspace() in the script. -->
+<div id="welcome-screen" class="fade-screen relative z-10 min-h-screen flex flex-col items-center justify-center px-4 sm:px-6 py-10 sm:py-14">
+
+  <div class="w-full max-w-5xl mx-auto">
+
+    <!-- Header Card -->
+    <div class="glass-panel glow-border-purple rounded-3xl px-6 sm:px-10 py-10 sm:py-12 text-center fade-in-up">
+
+      <div class="flex justify-center mb-6">
+        <div class="relative w-20 h-20 sm:w-24 sm:h-24 flex items-center justify-center">
+          <svg class="seal-ring absolute inset-0" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <circle cx="50" cy="50" r="46" stroke="url(#ringGrad)" stroke-width="1.5" stroke-dasharray="4 6"/>
+            <defs>
+              <linearGradient id="ringGrad" x1="0" y1="0" x2="100" y2="100">
+                <stop offset="0%" stop-color="#C9A876"/>
+                <stop offset="100%" stop-color="#8B5CF6"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          <!-- Logo image with a graceful degrade: tries .avif then .png
+               via <picture>, and if BOTH fail to load, onerror hides the
+               broken <img> and reveals the plain "scale" icon fallback
+               div sitting beneath it. -->
+          <picture>
+            <source srcset="/static/logo.avif" type="image/avif" />
+            <img src="/static/logo.png" alt="DOMINION LexOracle Logo" class="h-16 w-16 sm:h-20 sm:w-20 rounded-full object-cover ring-2 ring-brass-500/40 bg-slate-800"
+              onerror="this.onerror=null;this.src='';this.style.display='none';this.nextElementSibling.style.display='flex';" />
+          </picture>
+          <div style="display:none;" class="h-12 w-12 sm:h-14 sm:w-14 rounded-full bg-slate-800 ring-2 ring-brass-500/40 items-center justify-center absolute">
+            <i data-lucide="scale" class="w-6 h-6 text-brass-400"></i>
+          </div>
+        </div>
+      </div>
+
+      <div class="inline-flex items-center gap-2 badge-codealpha rounded-full px-3.5 py-1 mb-4">
+        <i data-lucide="sparkles" class="w-3.5 h-3.5 text-purple-accent"></i>
+        <span class="text-xs font-semibold tracking-wide text-purple-accent">CodeAlpha AI Edition</span>
+      </div>
+
+      <h1 class="font-display text-3xl sm:text-4xl md:text-5xl font-semibold tracking-tight text-parchment">
+        DOMINION <span class="text-gold">LexOracle</span>
+      </h1>
+      <p class="text-silver text-sm sm:text-base mt-3 max-w-xl mx-auto">
+        Enterprise Statutory Legal Intelligence Engine, grounded in verifiable citation and built for courtroom-grade precision.
+      </p>
+    </div>
+
+    <!-- Feature Grid: purely descriptive marketing cards, no JS wiring. -->
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-6">
+
+      <div class="feature-card glass-panel glow-border-gold rounded-2xl p-5 fade-in-up" style="animation-delay:.05s">
+        <div class="w-10 h-10 rounded-xl bg-brass-500/10 border border-brass-500/30 flex items-center justify-center mb-4">
+          <i data-lucide="search-code" class="w-5 h-5 text-gold"></i>
+        </div>
+        <h3 class="font-semibold text-sm text-parchment mb-1.5">Statutory RAG Search</h3>
+        <p class="text-xs text-silver leading-relaxed">Pinecone Vector DB retrieval paired with Groq GPT-OSS reasoning over primary legislation.</p>
+      </div>
+
+      <div class="feature-card glass-panel glow-border-gold rounded-2xl p-5 fade-in-up" style="animation-delay:.1s">
+        <div class="w-10 h-10 rounded-xl bg-purple-500/10 border border-purple-500/30 flex items-center justify-center mb-4">
+          <i data-lucide="languages" class="w-5 h-5 text-purple-accent"></i>
+        </div>
+        <h3 class="font-semibold text-sm text-parchment mb-1.5">Multilingual Translation</h3>
+        <p class="text-xs text-silver leading-relaxed">Google Translate as primary engine, with automatic MyMemory fallback for continuity.</p>
+      </div>
+
+      <div class="feature-card glass-panel glow-border-gold rounded-2xl p-5 fade-in-up" style="animation-delay:.15s">
+        <div class="w-10 h-10 rounded-xl bg-brass-500/10 border border-brass-500/30 flex items-center justify-center mb-4">
+          <i data-lucide="mic" class="w-5 h-5 text-gold"></i>
+        </div>
+        <h3 class="font-semibold text-sm text-parchment mb-1.5">Real-Time Dictation</h3>
+        <p class="text-xs text-silver leading-relaxed">Native browser voice capture with live speech-to-text transcription while you speak.</p>
+      </div>
+
+      <div class="feature-card glass-panel glow-border-gold rounded-2xl p-5 fade-in-up" style="animation-delay:.2s">
+        <div class="w-10 h-10 rounded-xl bg-purple-500/10 border border-purple-500/30 flex items-center justify-center mb-4">
+          <i data-lucide="volume-2" class="w-5 h-5 text-purple-accent"></i>
+        </div>
+        <h3 class="font-semibold text-sm text-parchment mb-1.5">In-Memory Playback</h3>
+        <p class="text-xs text-silver leading-relaxed">gTTS synthesis streamed straight from BytesIO, with zero temporary audio files on disk.</p>
+      </div>
+
+    </div>
+
+    <!-- CTA: #enter-workspace-btn -> goToWorkspace() in the script. -->
+    <div class="flex flex-col items-center mt-9 fade-in-up" style="animation-delay:.28s">
+      <button id="enter-workspace-btn" class="btn-primary text-slate-950 font-semibold text-sm sm:text-base rounded-full px-8 py-3.5 inline-flex items-center gap-2.5">
+        <i data-lucide="door-open" class="w-4.5 h-4.5"></i>
+        Enter Workspace
+      </button>
+      <p class="text-silver text-xs mt-4 text-center px-2">
+        <i data-lucide="shield-check" class="w-3.5 h-3.5 inline-block align-text-bottom mr-1"></i>
+        Answers are grounded in cited statutory sources, verify before filing.
+      </p>
+    </div>
+
+  </div>
+</div>
+
+<!-- ------------ MAIN WORKSPACE ------------ -->
+<!-- The actual chat app. Starts hidden (class="hidden") until
+     goToWorkspace() reveals it. Everything a person interacts with here
+     is wired up in the <script> block near the bottom of the file. -->
+<div id="workspace-screen" class="fade-screen fade-out relative z-10 min-h-screen flex flex-col hidden">
+
+  <!-- Header Bar -->
+  <header class="glass-panel border-b border-white/5 sticky top-0 z-30">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
+      <div class="flex items-center gap-3 min-w-0">
+        <!-- #back-to-welcome / #header-home-btn: both call goToWelcome(). -->
+        <button id="back-to-welcome" class="sm:hidden p-1.5 -ml-1.5 rounded-lg hover:bg-white/5 text-silver" aria-label="Back">
+          <i data-lucide="chevron-left" class="w-5 h-5"></i>
+        </button>
+        <button id="header-home-btn" class="flex items-center gap-3 min-w-0 text-left rounded-lg hover:bg-white/5 -ml-1.5 pl-1.5 pr-2 py-1 transition-colors" aria-label="Return to welcome screen">
+          <picture>
+            <source srcset="/static/logo.avif" type="image/avif" />
+            <img src="/static/logo.png" alt="" class="h-8 w-8 rounded-full object-cover ring-1 ring-brass-500/40 bg-slate-800 flex-shrink-0"
+              onerror="this.style.display='none';" />
+          </picture>
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <h2 class="font-display font-semibold text-sm sm:text-base text-parchment truncate">DOMINION LexOracle</h2>
+              <span class="hidden sm:inline-flex items-center gap-1 badge-codealpha rounded-full px-2 py-0.5 text-[10px] font-semibold text-purple-accent tracking-wide">
+                CodeAlpha
+              </span>
+            </div>
+            <p class="text-[11px] text-silver truncate hidden sm:block">Statutory Legal Intelligence Engine</p>
+          </div>
+        </button>
+      </div>
+
+      <div class="flex items-center gap-2 sm:gap-4">
+        <!-- Static status labels (desktop) - not wired to any live
+             backend health check, just fixed decorative text; see the
+             matching #status-btn mobile popover below for the same
+             content on small screens. -->
+        <div class="hidden md:flex items-center gap-3.5 font-mono text-[11px] text-silver">
+          <span class="flex items-center gap-1.5"><span class="status-dot bg-emerald-400"></span>Engine: Active</span>
+          <span class="flex items-center gap-1.5"><span class="status-dot bg-brass-400"></span>Pinecone: Connected</span>
+          <span class="flex items-center gap-1.5"><span class="status-dot bg-purple-400"></span>TTS: In-Memory</span>
+        </div>
+        <!-- #status-btn: mobile-only equivalent, builds a small popover
+             on click (see the handler near the bottom of the script). -->
+        <button id="status-btn" class="md:hidden p-2 rounded-lg hover:bg-white/5 text-silver relative" aria-label="System status">
+          <i data-lucide="activity" class="w-4.5 h-4.5"></i>
+          <span class="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+        </button>
+        <div class="relative">
+          <!-- #settings-btn opens/closes #settings-dropdown (handlers
+               near the bottom of the script, alongside the language
+               dropdown handlers). -->
+          <button id="settings-btn" class="p-2 rounded-lg hover:bg-white/5 text-silver" aria-label="Settings" aria-haspopup="true" aria-expanded="false">
+            <i data-lucide="settings" class="w-4.5 h-4.5"></i>
+          </button>
+          <div id="settings-dropdown" class="lang-dropdown hidden absolute top-full mt-2 right-0 glass-panel glow-border-purple rounded-xl py-1.5 w-60 z-40 opacity-0 scale-95">
+            <!-- #clear-chat-btn just empties #chat-log client-side - does 
+                 NOT call the backend, so the session history stored
+                 server-side in main.py's chat_sessions dict is
+                 untouched by this button. -->
+            <button id="clear-chat-btn" class="w-full text-left px-3.5 py-2 text-xs text-parchment hover:bg-white/5 flex items-center gap-2.5">
+              <i data-lucide="trash-2" class="w-3.5 h-3.5 text-silver"></i> Clear Chat
+            </button>
+            <div class="px-3.5 py-2 text-[11px] text-silver flex items-center gap-2.5 border-t border-white/5 mt-1 pt-2.5">
+              <i data-lucide="accessibility" class="w-3.5 h-3.5 flex-shrink-0"></i>
+              <!-- #motion-status text is set once at load time from the
+                   OS-level prefers-reduced-motion media query - read-only
+                   display, not a toggle. -->
+              <span>Reduced motion: <span id="motion-status" class="text-parchment font-medium">Off</span></span>
+            </div>
+            <button id="return-home-btn" class="w-full text-left px-3.5 py-2 text-xs text-parchment hover:bg-white/5 flex items-center gap-2.5 border-t border-white/5 mt-1 pt-2.5">
+              <i data-lucide="door-open" class="w-3.5 h-3.5 text-gold"></i> Return to Welcome Screen
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Filter Chips: data-filter on each button is read by applyFilter()
+         (client-side visibility only) AND by sendMessage()/
+         sendAudioMessage() as the `doc_filter` form field sent to
+         POST /api/v1/chat - see wiring map #7. -->
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 pb-3 flex gap-2 overflow-x-auto scrollbar-thin">
+      <button data-filter="all" class="filter-chip active flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-parchment">All</button>
+      <button data-filter="constitution" class="filter-chip flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-silver">Constitution</button>
+      <button data-filter="cama" class="filter-chip flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-silver">CAMA</button>
+      <button data-filter="evidence" class="filter-chip flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-silver">Evidence</button>
+      <button data-filter="acja" class="filter-chip flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-silver">ACJA</button>
+      <button data-filter="criminal_code" class="filter-chip flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-silver">Criminal Code</button>
+      <button data-filter="penal_code" class="filter-chip flex-shrink-0 text-xs font-medium rounded-full px-3.5 py-1.5 border border-white/10 text-silver">Penal Code</button>
+    </div>
+  </header>
+
+  <!-- Chat Sequence: #chat-log is the container every addUserBubble() /
+       addUserVoiceBubble() / addAssistantBubble() / showTyping() call
+       appends a new row into. -->
+  <main id="chat-container" class="flex-1 overflow-y-auto scrollbar-thin">
+    <div id="chat-log" class="max-w-3xl mx-auto px-4 sm:px-6 py-6 flex flex-col gap-5"></div>
+    <div class="h-4"></div>
+  </main>
+
+  <!-- Input Bar -->
+  <div class="glass-panel border-t border-white/5 sticky bottom-0 z-30">
+    <div class="max-w-3xl mx-auto px-4 sm:px-6 pt-3 pb-2">
+
+      <div class="flex items-center justify-between mb-2.5">
+        <div class="relative flex items-center gap-2">
+          <!-- #lang-btn toggles #lang-dropdown open/closed; #lang-current
+               holds the actual language string sent to the backend on
+               every request (see wiring map #4). -->
+          <button id="lang-btn" class="flex items-center gap-1.5 text-xs text-silver hover:text-parchment border border-white/10 rounded-full px-3 py-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+            <i data-lucide="globe" class="w-3.5 h-3.5"></i>
+            <span id="lang-current">English (US)</span>
+            <i data-lucide="chevron-down" class="w-3 h-3"></i>
+          </button>
+          <!-- #lang-lock-indicator: shown/hidden by setLangControlsLocked()
+               while a retranslateAllBubbles() batch is in flight. -->
+          <span id="lang-lock-indicator" class="hidden items-center gap-1 text-[10px] text-gold font-mono">
+            <i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i> Translating…
+          </span>
+          <div id="lang-dropdown" class="lang-dropdown hidden absolute bottom-full mb-2 left-0 glass-panel glow-border-purple rounded-xl py-1.5 w-56 z-40 opacity-0 scale-95">
+            <p class="px-3.5 pt-1.5 pb-1 text-[10px] uppercase tracking-wide text-silver/60">English accent</p>
+            <!-- Each .lang-option's data-lang is exactly the string that
+                 ends up as #lang-current's text and as the `target_lang`
+                 / `lang` value sent on every subsequent API call — these
+                 strings must match what services/audio_handler.py's
+                 LANG_CODE_MAP / ENGLISH_TLDS and services/translator.py's
+                 lang_map expect on the backend. -->
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-parchment hover:bg-white/5 flex items-center justify-between disabled:opacity-40 disabled:cursor-not-allowed" data-lang="English (US)">English (US) <i data-lucide="check" class="w-3 h-3 text-gold"></i></button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="English (UK)">English (UK)</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="English (Nigeria)">English (Nigeria)</button>
+            <p class="px-3.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-silver/60 border-t border-white/5 mt-1">Language</p>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="Yoruba">Yoruba</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="Hausa">Hausa</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="Igbo">Igbo</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="French">French</button>
+          </div>
+        </div>
+        <span id="translate-source" class="text-[10px] text-silver font-mono">Google Translate, MyMemory fallback</span>
+      </div>
+
+      <div class="flex items-end gap-2">
+        <div class="flex-1 flex items-center gap-2 bg-slate-900/70 border border-white/10 focus-within:border-brass-500/50 rounded-2xl px-3 py-2 transition-colors">
+          <!-- #mic-btn: click starts/stops recording via MediaRecorder;
+               see the mic-btn handler near the bottom of the script. -->
+          <button id="mic-btn" class="p-1.5 rounded-full text-silver hover:text-gold flex-shrink-0 transition-colors" aria-label="Dictate">
+            <i data-lucide="mic" class="w-4.5 h-4.5"></i>
+          </button>
+          <!-- #chat-input: its 'input'/'paste'/'keydown' listeners (auto-
+               resize, mic-icon show/hide, Enter-to-send) are set up in
+               the try/catch block near the top of the script. -->
+          <textarea id="chat-input" rows="1" placeholder="Ask about a section, case posture, or statute..."
+            autocomplete="off" spellcheck="false"
+            class="flex-1 bg-transparent outline-none text-sm text-parchment placeholder:text-silver/60 min-w-0 chat-input-box"></textarea>
+        </div>
+        <!-- #send-btn -> sendMessage(). -->
+        <button id="send-btn" class="btn-primary flex-shrink-0 w-11 h-11 rounded-full flex items-center justify-center text-slate-950" aria-label="Send">
+          <i data-lucide="arrow-up" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <!-- #voice-preview-bar: shown after a mic recording stops, lets
+           the user preview/cancel/send the clip before it's actually
+           transmitted - see mediaRecorder.onstop and the three preview
+           button handlers below. -->
+      <div id="voice-preview-bar" class="hidden items-center gap-3 bg-slate-900/70 border border-white/10 rounded-2xl px-3 py-2 mt-2">
+        <button id="voice-preview-play" class="p-1.5 rounded-full text-gold hover:text-parchment flex-shrink-0">
+          <i data-lucide="play" class="w-4.5 h-4.5"></i>
+        </button>
+        <div class="flex-1 text-xs text-silver">Voice message ready</div>
+        <button id="voice-preview-cancel" class="p-1.5 rounded-full text-silver hover:text-red-400 flex-shrink-0" aria-label="Discard">
+          <i data-lucide="trash-2" class="w-4.5 h-4.5"></i>
+        </button>
+        <button id="voice-preview-send" class="btn-primary rounded-full px-4 py-1.5 text-xs font-semibold text-slate-950">Send</button>
+      </div>
+
+      <!-- #mic-status: shown/hidden alongside the .mic-recording CSS
+           class while actively recording. -->
+      <p id="mic-status" class="text-[11px] text-red-400 font-mono mt-1.5 hidden">Listening, speak now...</p>
+    </div>
+
+    <footer class="text-center pb-3 pt-1">
+      <p class="text-[10px] text-silver/70 font-mono px-4">
+        Engineered with FastAPI, Groq, Pinecone, gTTS and deep-translator : CodeAlpha AI Project
+      </p>
+    </footer>
+  </div>
+</div>
+
+<!-- ============ CITATION BOTTOM SHEET ============ -->
+<!-- Populated entirely client-side by openSheet(key) from the
+     dynamicCitationData already held in memory (built when each chat
+     response's citations were rendered) - opening this sheet makes NO
+     new network request. See wiring map #6. -->
+<div id="bottom-sheet-backdrop" class="fixed inset-0 bg-slate-950/70 z-40 hidden opacity-0"></div>
+<div id="bottom-sheet" class="fixed left-0 right-0 bottom-0 z-50 translate-y-full">
+  <div class="glass-panel glow-border-gold rounded-t-3xl max-w-2xl mx-auto max-h-[75vh] flex flex-col">
+    <div class="flex items-center justify-center pt-2.5">
+      <div class="w-10 h-1 rounded-full bg-white/15"></div>
+    </div>
+    <div class="flex items-start justify-between px-5 sm:px-6 pt-3 pb-2">
+      <div>
+        <!-- Placeholder text below is overwritten by openSheet() on
+             every open; what's shown here is only what a person would
+             see for a split second before any citation has ever been
+             clicked. -->
+        <p id="sheet-doc-title" class="font-display font-semibold text-parchment text-base sm:text-lg">CAMA 2020</p>
+        <p id="sheet-doc-section" class="text-xs text-gold font-mono mt-0.5">Sec 18(2)</p>
+      </div>
+      <!-- #close-sheet -> closeSheet(). -->
+      <button id="close-sheet" class="p-2 rounded-lg hover:bg-white/5 text-silver" aria-label="Close">
+        <i data-lucide="x" class="w-5 h-5"></i>
+      </button>
+    </div>
+    <div class="px-5 sm:px-6 pb-3 flex items-center gap-2">
+      <span class="inline-flex items-center gap-1 text-[11px] font-mono text-emerald-400 bg-emerald-400/10 border border-emerald-400/25 rounded-full px-2.5 py-1">
+        <i data-lucide="target" class="w-3 h-3"></i> Match: 88.7%
+      </span>
+      <span class="inline-flex items-center gap-1 text-[11px] font-mono text-silver bg-white/5 border border-white/10 rounded-full px-2.5 py-1">
+        <i data-lucide="database" class="w-3 h-3"></i> Pinecone Vector Index
+      </span>
+    </div>
+    <div class="overflow-y-auto scrollbar-thin px-5 sm:px-6 pb-6 pt-1">
+      <!-- #sheet-body-text: filled with renderMarkdown(data.text) inside
+           openSheet(), where data.text is the raw chunk text originally
+           returned by services/vector_store.py's search_laws() and
+           passed straight through in the /api/v1/chat citations array. -->
+      <p id="sheet-body-text" class="text-sm leading-relaxed text-silver font-mono border-l-2 border-brass-500/40 pl-4">
+        Loading statutory text...
+      </p>
+      <div class="flex gap-2 mt-5">
+        <!-- #copy-text-btn: copies #sheet-body-text's rendered text to
+             the clipboard — purely a browser API call, no backend
+             request. -->
+        <button id="copy-text-btn" class="flex-1 flex items-center justify-center gap-1.5 text-xs font-medium text-parchment border border-white/10 rounded-xl py-2.5 hover:bg-white/5 transition-colors">
+          <i data-lucide="copy" class="w-3.5 h-3.5"></i> Copy Text
+        </button>
+        <!-- #open-statute-btn: opens a URL looked up in `actSourceUrls`
+             (loaded once from /static/source-links.json), keyed by
+             currentSheetDoc — a static asset lookup, not a FastAPI call. -->
+        <button id="open-statute-btn" class="flex-1 flex items-center justify-center gap-1.5 text-xs font-medium text-slate-950 btn-primary rounded-xl py-2.5">
+          <i data-lucide="external-link" class="w-3.5 h-3.5"></i> Open Full Statute
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+lucide.createIcons();
+
+/* ---------------- Particle Network Canvas ---------------- */
+/* Purely decorative background animation drawn into #particle-canvas.
+   Self-contained IIFE - does not read from or write to any chat/app
+   state, and nothing outside this block touches it. Safe to skip when
+   tracing app wiring; included here only for completeness. */
+(function(){
+  const canvas = document.getElementById('particle-canvas');
+  const ctx = canvas.getContext('2d');
+  let w, h, particles = [];
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const COUNT = window.innerWidth < 640 ? 46 : 90;
+  const colors = ['rgba(139,92,246,0.6)','rgba(198,168,118,0.55)','rgba(148,163,184,0.42)'];
+
+  function resize(){
+    w = canvas.width = window.innerWidth;
+    h = canvas.height = window.innerHeight;
+    buildFormations();
+  }
+
+  function makeParticles(){
+    particles = [];
+    for(let i=0;i<COUNT;i++){
+      particles.push({
+        x: Math.random()*w,
+        y: Math.random()*h,
+        vx: (Math.random()-0.5)*0.22,
+        vy: (Math.random()-0.5)*0.22,
+        r: Math.random()*1.7+0.6,
+        c: colors[Math.floor(Math.random()*colors.length)],
+        tx: 0, ty: 0,
+        jitterPhase: Math.random()*Math.PI*2
+      });
+    }
+  }
+
+  let formations = [];
+  function buildFormations(){
+    const cx = w*0.5, cy = h*0.42;
+    const rings = [];
+    const ringCounts = [10, 16, 22, 26];
+    const ringRadii = [Math.min(w,h)*0.09, Math.min(w,h)*0.16, Math.min(w,h)*0.23, Math.min(w,h)*0.30];
+    ringCounts.forEach((n, ri)=>{
+      for(let i=0;i<n;i++){
+        const a = (i/n)*Math.PI*2 + ri*0.3;
+        rings.push({ x: cx + Math.cos(a)*ringRadii[ri], y: cy + Math.sin(a)*ringRadii[ri]*0.7 });
+      }
+    });
+
+    const gridPts = [];
+    const cols = 12, gridRows = 8;
+    const spacingX = w/(cols+1), spacingY = h/(gridRows+1);
+    for(let gy=1; gy<=gridRows; gy++){
+      for(let gx=1; gx<=cols; gx++){
+        gridPts.push({
+          x: gx*spacingX + (Math.random()-0.5)*18,
+          y: gy*spacingY + (Math.random()-0.5)*18
+        });
+      }
+    }
+
+    formations = [rings, gridPts];
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+  makeParticles();
+
+  const mouse = {x:null, y:null};
+  window.addEventListener('mousemove', e=>{ mouse.x = e.clientX; mouse.y = e.clientY; });
+  window.addEventListener('mouseleave', ()=>{ mouse.x = null; mouse.y = null; });
+
+  const PHASE = { DRIFT:'drift', CONVERGE:'converge', HOLD:'hold', SCATTER:'scatter' };
+  let phase = PHASE.DRIFT;
+  let phaseStart = performance.now();
+  let formationIndex = 0;
+  const DURATIONS = { drift: 6500, converge: 2400, hold: 3200, scatter: 1400 };
+
+  function assignTargets(){
+    const pts = formations[formationIndex % formations.length];
+    formationIndex++;
+    const shuffled = [...pts].sort(()=>Math.random()-0.5);
+    particles.forEach((p, i)=>{
+      const target = shuffled[i % shuffled.length];
+      p.tx = target.x;
+      p.ty = target.y;
+    });
+  }
+
+  function scatterBurst(){
+    const cx = w/2, cy = h/2;
+    particles.forEach(p=>{
+      const dx = p.x - cx, dy = p.y - cy;
+      const dist = Math.sqrt(dx*dx+dy*dy) || 1;
+      const force = 2.2 + Math.random()*2.6;
+      p.vx = (dx/dist)*force + (Math.random()-0.5)*0.6;
+      p.vy = (dy/dist)*force + (Math.random()-0.5)*0.6;
+    });
+  }
+
+  function resumeDrift(){
+    particles.forEach(p=>{
+      p.vx = (Math.random()-0.5)*0.22;
+      p.vy = (Math.random()-0.5)*0.22;
+    });
+  }
+
+  function advancePhase(now){
+    const elapsed = now - phaseStart;
+    if(elapsed < DURATIONS[phase]) return;
+    phaseStart = now;
+    if(phase === PHASE.DRIFT){ phase = PHASE.CONVERGE; assignTargets(); }
+    else if(phase === PHASE.CONVERGE){ phase = PHASE.HOLD; }
+    else if(phase === PHASE.HOLD){ phase = PHASE.SCATTER; scatterBurst(); }
+    else if(phase === PHASE.SCATTER){ phase = PHASE.DRIFT; resumeDrift(); }
+  }
+
+  function step(now){
+    ctx.clearRect(0,0,w,h);
+    advancePhase(now);
+
+    for(const p of particles){
+      if(phase === PHASE.DRIFT){
+        p.x += p.vx; p.y += p.vy;
+        if(p.x < 0 || p.x > w) p.vx *= -1;
+        if(p.y < 0 || p.y > h) p.vy *= -1;
+      } else if(phase === PHASE.CONVERGE){
+        p.x += (p.tx - p.x) * 0.045;
+        p.y += (p.ty - p.y) * 0.045;
+      } else if(phase === PHASE.HOLD){
+        const breathe = Math.sin(now*0.0016 + p.jitterPhase) * 2.2;
+        p.x += (p.tx + breathe - p.x) * 0.08;
+        p.y += (p.ty + breathe - p.y) * 0.08;
+      } else if(phase === PHASE.SCATTER){
+        p.x += p.vx; p.y += p.vy;
+        p.vx *= 0.985; p.vy *= 0.985;
+        if(p.x < -20) p.x = w+20;
+        if(p.x > w+20) p.x = -20;
+        if(p.y < -20) p.y = h+20;
+        if(p.y > h+20) p.y = -20;
+      }
+
+      if(mouse.x !== null && phase !== PHASE.HOLD){
+        const dx = p.x - mouse.x, dy = p.y - mouse.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if(dist < 120 && dist > 0.01){
+          p.x += dx/dist*0.4;
+          p.y += dy/dist*0.4;
+        }
+      }
+
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fillStyle = p.c;
+      ctx.fill();
+    }
+
+    const linkDist = (phase === PHASE.HOLD || phase === PHASE.CONVERGE) ? 105 : 130;
+    for(let i=0;i<particles.length;i++){
+      for(let j=i+1;j<particles.length;j++){
+        const dx = particles[i].x - particles[j].x;
+        const dy = particles[i].y - particles[j].y;
+        const dist = Math.sqrt(dx*dx+dy*dy);
+        if(dist < linkDist){
+          ctx.beginPath();
+          ctx.moveTo(particles[i].x, particles[i].y);
+          ctx.lineTo(particles[j].x, particles[j].y);
+          ctx.strokeStyle = `rgba(139,92,246,${0.14*(1-dist/linkDist)})`;
+          ctx.lineWidth = 0.6;
+          ctx.stroke();
+        }
+      }
+    }
+
+    if(!reduceMotion) requestAnimationFrame(step);
+  }
+
+  if(reduceMotion){
+    step(performance.now());
+  } else {
+    requestAnimationFrame(step);
+  }
+})();
+
+/* ---------------- Screen Transition ---------------- */
+/* Wired to #enter-workspace-btn, #back-to-welcome, #header-home-btn
+   (-> goToWorkspace/goToWelcome directly) and #return-home-btn
+   (-> goToWelcome, via the settings dropdown handler further down). */
+const welcomeScreen = document.getElementById('welcome-screen');
+const workspaceScreen = document.getElementById('workspace-screen');
+
+function goToWorkspace(){
+  welcomeScreen.classList.add('fade-out');
+  setTimeout(()=>{
+    welcomeScreen.classList.add('hidden');
+    workspaceScreen.classList.remove('hidden');
+    requestAnimationFrame(()=> workspaceScreen.classList.remove('fade-out'));
+    lucide.createIcons();
+  }, 480);
+}
+
+function goToWelcome(){
+  workspaceScreen.classList.add('fade-out');
+  setTimeout(()=>{
+    workspaceScreen.classList.add('hidden');
+    welcomeScreen.classList.remove('hidden');
+    requestAnimationFrame(()=> welcomeScreen.classList.remove('fade-out'));
+  }, 480);
+}
+
+document.getElementById('enter-workspace-btn').addEventListener('click', goToWorkspace);
+document.getElementById('back-to-welcome').addEventListener('click', goToWelcome);
+document.getElementById('header-home-btn').addEventListener('click', goToWelcome);
+
+/* ---------------- Filter Chips ---------------- */
+/* See wiring map #7: applyFilter() only controls visibility of already-
+   rendered bubbles client-side. The SAME chip's data-filter is read
+   separately (by sendMessage()/sendAudioMessage() further down) as the
+   `doc_filter` value sent to the backend on the next message - clicking
+   a chip does not, by itself, trigger any network request. */
+const chips = document.querySelectorAll('.filter-chip');
+chips.forEach(chip=>{
+  chip.addEventListener('click', ()=>{
+    chips.forEach(c=>{c.classList.remove('active'); c.classList.add('text-silver'); c.classList.remove('text-parchment');});
+    chip.classList.add('active');
+    chip.classList.remove('text-silver');
+    chip.classList.add('text-parchment');
+    applyFilter(chip.dataset.filter);
+  });
+});
+
+function applyFilter(tag){
+  document.querySelectorAll('.chat-bubble-row').forEach(row=>{
+    if(tag === 'all' || row.dataset.doc === tag || row.dataset.doc === 'general'){
+      row.style.display = '';
+    } else {
+      row.style.display = 'none';
+    }
+  });
+}
+
+/* Maps a citation's raw `act` name (as stored in Pinecone metadata by
+   services/ingest.py, e.g. "CAMA_2020") down to one of the fixed
+   data-filter tag values used by the .filter-chip buttons above, so a
+   newly-added assistant bubble's row.dataset.doc lines up with
+   whichever chip should reveal/hide it. Falls back to "general" for
+   anything unrecognized (which applyFilter() always shows, regardless
+   of the active chip). */
+function normalizeDocTag(actName){
+  if(!actName) return 'general';
+  const key = actName.toLowerCase();
+  if(key.includes('constitution')) return 'constitution';
+  if(key.includes('cama')) return 'cama';
+  if(key.includes('evidence')) return 'evidence';
+  if(key.includes('acja')) return 'acja';
+  if(key.includes('criminal_code')) return 'criminal_code';
+  if(key.includes('penal_code')) return 'penal_code';
+  return 'general';
+}
+
+/* CHANGED: replaces the old regex-based formatAnswerText(). The system
+   prompt now asks the model for real Markdown (headers, tables, bold,
+   bullets, horizontal rules), so this uses an actual Markdown parser
+   (marked) instead of a couple of hand-written regex rules that only
+   understood **bold** and "* " bullets. DOMPurify sanitizes the parsed
+   HTML before it's ever inserted with innerHTML, since this text
+   originates from an LLM (and, for the citation sheet, from
+   PDF-extracted statute text), neither of which should be trusted to
+   inject raw HTML/script content. Output is wrapped in a
+   .markdown-body div so the CSS rules added above only style actual
+   rendered answers, not the rest of the page. */
+marked.setOptions({ gfm: true, breaks: true });
+
+/* Called from EVERY place raw text becomes on-screen HTML: addUserBubble(),
+   addAssistantBubble(), retranslateAllBubbles(), playAudio(), and
+   openSheet() - see wiring map #8. This is the ONLY function in the file
+   that runs untrusted text (LLM output, extracted PDF text) through
+   innerHTML, and it always does so via marked -> DOMPurify first. */
+function renderMarkdown(text){
+  const rawHtml = marked.parse(String(text));
+  const clean = DOMPurify.sanitize(rawHtml);
+  return `<div class="markdown-body">${clean}</div>`;
+}
+
+/* CHANGED: now also strips headers, table pipes/separator rows, and
+   horizontal rules, since the model's answers can contain all of these
+   now - not just **bold** and "* " bullets like before. Without this,
+   gTTS would read "hash hash hash" and pipe characters aloud. */
+/* Called only from playAudio(), right before the text is sent to
+   POST /api/v1/tts (see wiring map #5) - this is the ONE place in the
+   file that prepares text for SPEECH rather than for on-screen
+   rendering; renderMarkdown() above is used for every other case. */
+function stripMarkdownForSpeech(text){
+  return String(text)
+    .replace(/^#{1,6}\s+/gm, '')                    // drop heading markers
+    .replace(/\*\*(.+?)\*\*/g, '$1')                 // **bold** -> bold
+    .replace(/(^|\n)[-*]\s+/g, '$1')                 // drop leading bullet markers
+    .replace(/^\s*\|?[-:\s|]+\|[-:\s|]+$/gm, '')     // drop table separator rows
+    .replace(/\|/g, ', ')                            // remaining table pipes -> pause
+    .replace(/^---+$/gm, '')                         // drop horizontal rules
+    .replace(/\*/g, '')                              // catch stray asterisks
+    .replace(/\n{2,}/g, '. ')                        // collapse blank lines into a pause
+    .trim();
+}
+
+/* Loaded once, at page load - NOT a FastAPI route, this is a plain
+   static JSON file served via the app.mount("/static", ...) StaticFiles
+   mount in main.py. Populates the `actSourceUrls` lookup table that
+   #open-statute-btn's click handler (further down) reads from, keyed by
+   `currentSheetDoc`. */
+let actSourceUrls = {};
+fetch('/static/source-links.json')
+  .then(response => response.json())
+  .then(data => { actSourceUrls = data; })
+  .catch(err => console.error('Could not load source-links.json:', err));
+
+/* Tracks which act's citation sheet is currently open, so
+   #open-statute-btn's handler knows which key to look up in
+   `actSourceUrls`. Set by openSheet(), read by that button's handler. */
+let currentSheetDoc = null;
+
+/* ---------------- Citation Data & Chat API Logic ---------------- */
+const chatLog = document.getElementById('chat-log');
+const chatContainer = document.getElementById('chat-container');
+
+/* sessionId: starts as the literal string "null" (matching what main.py's
+   chat_endpoint checks for and treats as "no session yet, generate one").
+   Overwritten with the real UUID main.py returns after the FIRST
+   successful /api/v1/chat call, then reused as the `session_id` form
+   field on every subsequent call so main.py's touch_session() keeps
+   appending to the SAME server-side history list. */
+let sessionId = "null";
+
+/* Lookup table keyed by each citation's `key` (its Pinecone vector ID),
+   populated by citationPillHTML() as each chat response is rendered.
+   openSheet() reads from this - see wiring map #6. Never cleared, so it
+   simply accumulates every citation seen across the whole page session. */
+let dynamicCitationData = {};
+
+function scrollToBottom(){
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+/* Builds one citation pill's HTML AND, as a side effect, registers that
+   citation object into `dynamicCitationData` under its own `key` — this
+   is the only place entries get added to that lookup table. The pill's
+   onclick="openSheet('key')" is what wires a click to the bottom sheet. */
+function citationPillHTML(citeObj){
+  dynamicCitationData[citeObj.key] = citeObj;
+  return `<button class="citation-pill" data-key="${citeObj.key}" onclick="openSheet('${citeObj.key}')">
+    <span class="inline-flex items-center gap-1.5 text-[11px] font-mono text-gold bg-brass-500/10 border border-brass-500/30 rounded-full px-2.5 py-1 mr-1.5 mt-1.5">
+      <i data-lucide="scroll-text" class="w-3 h-3"></i> ${citeObj.doc} | ${citeObj.section} | Match: ${citeObj.match}
+    </span>
+  </button>`;
+}
+
+/* Called by a citation pill's inline onclick. Reads purely from the
+   already-populated `dynamicCitationData` (no fetch here at all) and
+   populates + reveals #bottom-sheet. See wiring map #6. */
+function openSheet(key){
+  const data = dynamicCitationData[key];
+  if(!data) return;
+  currentSheetDoc = data.doc;
+  document.getElementById('sheet-doc-title').textContent = data.doc;
+  document.getElementById('sheet-doc-section').textContent = data.section;
+  // CHANGED: renderMarkdown instead of formatAnswerText
+  document.getElementById('sheet-body-text').innerHTML = renderMarkdown(data.text);
+  document.querySelector('#bottom-sheet [data-lucide="target"]').parentElement.innerHTML =
+    '<i data-lucide="target" class="w-3 h-3"></i> Match: ' + data.match;
+
+  const backdrop = document.getElementById('bottom-sheet-backdrop');
+  const sheet = document.getElementById('bottom-sheet');
+  backdrop.classList.remove('hidden');
+  requestAnimationFrame(()=>{
+    backdrop.style.opacity = '1';
+    sheet.style.transform = 'translateY(0)';
+  });
+  lucide.createIcons();
+}
+
+function closeSheet(){
+  const backdrop = document.getElementById('bottom-sheet-backdrop');
+  const sheet = document.getElementById('bottom-sheet');
+  backdrop.style.opacity = '0';
+  sheet.style.transform = 'translateY(100%)';
+  setTimeout(()=> backdrop.classList.add('hidden'), 300);
+}
+document.getElementById('close-sheet').addEventListener('click', closeSheet);
+document.getElementById('bottom-sheet-backdrop').addEventListener('click', closeSheet);
+
+/* Browser Clipboard API only — no backend call. */
+document.getElementById('copy-text-btn').addEventListener('click', async () => {
+  const text = document.getElementById('sheet-body-text').textContent;
+  const btn = document.getElementById('copy-text-btn');
+  try {
+    await navigator.clipboard.writeText(text);
+    const original = btn.innerHTML;
+    btn.innerHTML = '<i data-lucide="check" class="w-3.5 h-3.5"></i> Copied!';
+    lucide.createIcons();
+    setTimeout(() => { btn.innerHTML = original; lucide.createIcons(); }, 1500);
+  } catch (err) {
+    console.error('Clipboard write failed:', err);
+  }
+});
+
+/* Reads `actSourceUrls` (loaded from /static/source-links.json above)
+   keyed by `currentSheetDoc` (set by openSheet()) and opens it in a new
+   tab - no FastAPI route involved. */
+document.getElementById('open-statute-btn').addEventListener('click', () => {
+  const url = actSourceUrls[currentSheetDoc];
+  if (url) window.open(url, '_blank');
+});
+
+/* Appends one right-aligned user text bubble to #chat-log. Called from
+   sendMessage() immediately when the user hits send, BEFORE the
+   /api/v1/chat request even goes out - so the user's own message
+   appears instantly regardless of backend latency. */
+function addUserBubble(text){
+  const row = document.createElement('div');
+  row.className = 'chat-bubble-row flex justify-end';
+  row.dataset.doc = 'general';
+  // CHANGED: renderMarkdown instead of formatAnswerText. User messages
+  // are plain text, so marked just wraps them in a <p> - harmless.
+  row.innerHTML = `
+    <div class="bubble-user rounded-2xl rounded-tr-sm px-4 py-2.5 max-w-[85%] sm:max-w-[75%] text-sm text-parchment leading-relaxed">
+      ${renderMarkdown(text)}
+    </div>`;
+  chatLog.appendChild(row);
+  scrollToBottom();
+}
+
+/* Appends a right-aligned voice-message bubble (with its own inline
+   play/pause + progress bar, entirely local <audio> playback of the
+   ORIGINAL recorded blob - not anything returned by the backend) plus
+   the transcript main.py sent back as `data.user_message`. Called from
+   sendAudioMessage() after the /api/v1/chat response comes back, unlike
+   addUserBubble() which is called before the request. */
+function addUserVoiceBubble(audioBlob, transcribedText){
+  const row = document.createElement('div');
+  row.className = 'chat-bubble-row flex justify-end';
+  row.dataset.doc = 'general';
+  const audioUrl = URL.createObjectURL(audioBlob);
+
+  row.innerHTML = `
+    <div class="bubble-user rounded-2xl rounded-tr-sm px-4 py-2.5 max-w-[85%] sm:max-w-[75%]">
+      <div class="flex items-center gap-2.5">
+        <button class="voice-note-play-btn p-1.5 rounded-full bg-white/10 hover:bg-white/20 flex-shrink-0 transition-colors">
+          <i data-lucide="play" class="w-4 h-4 text-parchment"></i>
+        </button>
+        <div class="flex-1 h-1 rounded-full bg-white/20 overflow-hidden">
+          <div class="voice-progress-fill h-full bg-parchment/70" style="width:0%"></div>
+        </div>
+        <i data-lucide="mic" class="w-3.5 h-3.5 text-silver flex-shrink-0"></i>
+      </div>
+      ${transcribedText ? `<p class="text-[11px] text-parchment/60 italic mt-1.5 leading-snug">"${transcribedText.replace(/"/g, '&quot;')}"</p>` : ''}
+    </div>`;
+
+  chatLog.appendChild(row);
+  lucide.createIcons();
+  scrollToBottom();
+
+  const audio = new Audio(audioUrl);
+  const playBtn = row.querySelector('.voice-note-play-btn');
+  const fill = row.querySelector('.voice-progress-fill');
+
+  playBtn.addEventListener('click', () => {
+    if (audio.paused) {
+      audio.play();
+      playBtn.innerHTML = '<i data-lucide="pause" class="w-4 h-4 text-parchment"></i>';
+    } else {
+      audio.pause();
+      playBtn.innerHTML = '<i data-lucide="play" class="w-4 h-4 text-parchment"></i>';
+    }
+    lucide.createIcons();
+  });
+
+  audio.addEventListener('timeupdate', () => {
+    if (audio.duration) fill.style.width = ((audio.currentTime / audio.duration) * 100) + '%';
+  });
+
+  audio.addEventListener('ended', () => {
+    playBtn.innerHTML = '<i data-lucide="play" class="w-4 h-4 text-parchment"></i>';
+    fill.style.width = '0%';
+    lucide.createIcons();
+  });
+}
+
+/* Appends a left-aligned assistant bubble. `text` is what's actually
+   RENDERED on screen (already translated, if applicable); `rawAnswer`
+   (always English) is stashed untouched in the .listen-btn's
+   data-raw-answer attribute for playAudio()/retranslateAllBubbles() to
+   reuse later without needing to re-fetch it; `citations` becomes the
+   row of citation pills via citationPillHTML(). Called from both
+   sendMessage() and sendAudioMessage() once their /api/v1/chat response
+   arrives. */
+function addAssistantBubble(text, rawAnswer, citations){
+  const row = document.createElement('div');
+  row.className = 'chat-bubble-row flex justify-start';
+
+  row.dataset.doc = (citations && citations[0]) ? normalizeDocTag(citations[0].doc) : 'general';
+
+  const pillsHTML = (citations || []).map(citationPillHTML).join('');
+
+  // CHANGED: the answer-text element is now a <div> (renderMarkdown
+  // returns block-level content, e.g. <h3>, <table>, <ul>, which can't
+  // legally sit inside a <p>) instead of the old <p class="answer-text">.
+  // playAudio() and retranslateAllBubbles() both look up '.answer-text'
+  // by class, so they keep working unchanged.
+  row.innerHTML = `
+    <div class="flex gap-2.5 max-w-[90%] sm:max-w-[80%]">
+      <div class="w-7 h-7 rounded-full bg-gradient-to-br from-brass-500 to-purple-500 flex-shrink-0 flex items-center justify-center mt-0.5">
+        <i data-lucide="scale" class="w-3.5 h-3.5 text-slate-950"></i>
+      </div>
+      <div>
+        <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-2.5">
+          <div class="answer-text text-sm text-parchment leading-relaxed">${renderMarkdown(text)}</div>
+          <div class="flex flex-wrap mt-0.5">${pillsHTML}</div>
+        </div>
+        <div class="flex items-center gap-2 mt-1.5">
+          <button class="listen-btn flex items-center gap-1.5 text-[11px] text-silver hover:text-gold transition-colors" data-raw-answer="${encodeURIComponent(rawAnswer || text)}">
+            <i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen
+          </button>
+          <span class="listen-unavailable-note hidden text-[11px] text-silver/60"></span>
+        </div>
+      </div>
+    </div>`;
+
+  chatLog.appendChild(row);
+  lucide.createIcons();
+  scrollToBottom();
+
+  const listenBtn = row.querySelector('.listen-btn');
+  listenBtn.addEventListener('click', () => playAudio(listenBtn, row));
+}
+
+/* Retranslation function pulled out to global scope to fix scope bug */
+/* Called from lockAndRetranslate() whenever the language dropdown
+   selection changes (see wiring map #4). Walks EVERY .listen-btn
+   currently in #chat-log (i.e. every assistant bubble ever added this
+   session), re-reads each one's stored raw English answer, resets its
+   Listen button/audio-cache state (since any previously-cached audio was
+   for the OLD language), and re-renders its on-screen text via
+   POST /api/v1/translate for the new `targetLang`. Does NOT touch
+   audio — no /api/v1/tts calls happen here; audio is only (re-)generated
+   later, on demand, if Listen is pressed again (playAudio() below). */
+async function retranslateAllBubbles(targetLang){
+  const listenButtons = document.querySelectorAll('.listen-btn');
+
+  for (const btn of listenButtons) {
+    const rawAnswer = decodeURIComponent(btn.getAttribute('data-raw-answer') || '');
+    if (!rawAnswer) continue;
+
+    const row = btn.closest('.chat-bubble-row');
+    const textEl = row ? row.querySelector('.answer-text') : null;
+
+    if (btn._audioEl) {
+      btn._audioEl.pause();
+      btn._audioEl = null;
+    }
+    btn._audioLang = null;
+    btn.dataset.playing = 'false';
+    btn.innerHTML = '<i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen';
+
+    const note = row ? row.querySelector('.listen-unavailable-note') : null;
+    if (note) note.classList.add('hidden');
+
+    try {
+      const response = await fetch('/api/v1/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: rawAnswer, lang: targetLang })
+      });
+      const data = await response.json();
+      // CHANGED: renderMarkdown instead of formatAnswerText
+      if (textEl && data.display_text) {
+        textEl.innerHTML = renderMarkdown(data.display_text);
+      }
+    } catch (err) {
+      console.error('Retranslation failed for a bubble:', err);
+    }
+  }
+
+  lucide.createIcons();
+}
+
+/* Handler for a single bubble's .listen-btn - see wiring map #5 for the
+   two-parallel-requests summary. `row` is that bubble's whole
+   .chat-bubble-row element, used to find its .answer-text and
+   .listen-unavailable-note siblings. */
+async function playAudio(btn, row){
+  const currentLang = document.getElementById('lang-current').textContent.trim();
+  const note = row.querySelector('.listen-unavailable-note');
+  note.classList.add('hidden');
+
+  // Fast path: audio for THIS language was already generated and is
+  // still cached on the button (btn._audioEl/_audioLang) from a
+  // previous Listen press - just toggle play/pause locally, no network
+  // request at all.
+  if (btn._audioEl && btn._audioLang === currentLang) {
+    if (btn.dataset.playing === 'true') {
+      btn._audioEl.pause();
+      btn.dataset.playing = 'false';
+      btn.innerHTML = '<i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen';
+    } else {
+      btn._audioEl.play();
+      btn.dataset.playing = 'true';
+      btn.innerHTML = '<i data-lucide="pause" class="w-3.5 h-3.5 text-gold"></i> Pause';
+    }
+    lucide.createIcons();
+    return;
+  }
+
+  if (btn._audioEl) {
+    btn._audioEl.pause();
+    btn._audioEl = null;
+  }
+
+  const rawAnswer = decodeURIComponent(btn.getAttribute('data-raw-answer') || '');
+  if (!rawAnswer) return;
+
+  btn.innerHTML = '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i> Loading...';
+  lucide.createIcons();
+
+  const textEl = row.querySelector('.answer-text');
+
+  /* Two separate requests, run in parallel:
+     - /api/v1/translate gets the ORIGINAL Markdown-intact rawAnswer
+       translated, so the on-screen text keeps its headers/tables/bullets
+       when rendered through renderMarkdown().
+     - /api/v1/tts gets the markdown-STRIPPED text, since gTTS has no use
+       for "#", "|", "**" and would read them aloud. Its own display_text
+       is ignored here on purpose - using it would flatten the on-screen
+       answer back down to plain prose, which is exactly the bug this
+       replaces. Audio is the only thing taken from this response. */
+  try {
+    const [translateResp, ttsResp] = await Promise.all([
+      fetch('/api/v1/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: rawAnswer, lang: currentLang })
+      }),
+      fetch('/api/v1/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: stripMarkdownForSpeech(rawAnswer), lang: currentLang })
+      })
+    ]);
+
+    const translateData = await translateResp.json();
+    if (textEl && translateData.display_text) {
+      textEl.innerHTML = renderMarkdown(translateData.display_text);
+    }
+
+    const ttsData = await ttsResp.json();
+
+    if (!ttsData.available || !ttsData.audio_base64) {
+      btn.innerHTML = '<i data-lucide="volume-x" class="w-3.5 h-3.5"></i> Listen';
+      lucide.createIcons();
+      note.textContent = `No audio available for ${currentLang}`;
+      note.classList.remove('hidden');
+      return;
+    }
+
+    const audio = new Audio("data:audio/mp3;base64," + ttsData.audio_base64);
+    btn._audioEl = audio;
+    btn._audioLang = currentLang;
+    btn.dataset.playing = 'true';
+    btn.innerHTML = '<i data-lucide="pause" class="w-3.5 h-3.5 text-gold"></i> Pause';
+    lucide.createIcons();
+    audio.play();
+
+    audio.onended = () => {
+      btn.dataset.playing = 'false';
+      btn.innerHTML = '<i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen';
+      lucide.createIcons();
+    };
+  } catch (err) {
+    console.error('TTS/translate request failed:', err);
+    btn.innerHTML = '<i data-lucide="volume-x" class="w-3.5 h-3.5"></i> Listen';
+    lucide.createIcons();
+    note.textContent = 'Could not load audio right now';
+    note.classList.remove('hidden');
+  }
+}
+
+/* Appends the three-dot "typing..." placeholder row to #chat-log. Called
+   right after addUserBubble()/addUserVoiceBubble(), removed again by
+   removeTyping() once the /api/v1/chat response actually arrives (in
+   both sendMessage() and sendAudioMessage()). */
+function showTyping(){
+  const row = document.createElement('div');
+  row.id = 'typing-row';
+  row.className = 'chat-bubble-row flex justify-start';
+  row.dataset.doc = 'general';
+  row.innerHTML = `
+    <div class="flex gap-2.5">
+      <div class="w-7 h-7 rounded-full bg-gradient-to-br from-brass-500 to-purple-500 flex-shrink-0 flex items-center justify-center mt-0.5">
+        <i data-lucide="scale" class="w-3.5 h-3.5 text-slate-950"></i>
+      </div>
+      <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1">
+        <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+        <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+        <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+      </div>
+    </div>`;
+  chatLog.appendChild(row);
+  lucide.createIcons();
+  scrollToBottom();
+}
+
+function removeTyping(){
+  const row = document.getElementById('typing-row');
+  if(row) row.remove();
+}
+
+/* Sets up #chat-input's auto-grow-height behavior, its mic-icon
+   show/hide (hidden once there's typed text, since mic input and typed
+   input are mutually exclusive per message), and Enter-to-send (Shift+Enter
+   still inserts a newline instead). Wrapped in try/catch purely so a
+   failure here can't block the rest of the script (e.g. the send button
+   wiring further down) from still running. */
+try {
+  const chatInputEl = document.getElementById('chat-input');
+  let baseInputHeight = chatInputEl.scrollHeight || 40;
+
+  function resizeChatInput(){
+    chatInputEl.style.height = 'auto';
+    const maxHeight = baseInputHeight * 2;
+    const needed = chatInputEl.scrollHeight;
+    if (needed > maxHeight) {
+      chatInputEl.style.height = maxHeight + 'px';
+      chatInputEl.classList.add('is-maxed');
+    } else {
+      chatInputEl.style.height = needed + 'px';
+      chatInputEl.classList.remove('is-maxed');
+    }
+  }
+
+  function updateMicVisibility(){
+    const micBtnEl = document.getElementById('mic-btn');
+    if (!micBtnEl) return;
+    micBtnEl.style.display = chatInputEl.value.trim() ? 'none' : '';
+  }
+
+  chatInputEl.addEventListener('input', () => {
+    resizeChatInput();
+    updateMicVisibility();
+  });
+
+  chatInputEl.addEventListener('paste', () => setTimeout(() => {
+    resizeChatInput();
+    updateMicVisibility();
+  }, 0));
+
+  chatInputEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  resizeChatInput();
+  updateMicVisibility();
+} catch (err) {
+  console.error('Chat input setup failed:', err);
+}
+
+/* THE primary text-message send path - see wiring map #2.
+   Reads #chat-input's value, #lang-current's text, and the currently
+   .active .filter-chip's data-filter, renders the user bubble
+   immediately, then POSTs a multipart form (session_id, text_input,
+   target_lang, doc_filter) to /api/v1/chat (main.py's chat_endpoint,
+   which internally calls services/rag.py's query_lex_oracle()). On
+   success, updates `sessionId` from the response and renders the
+   assistant bubble; on failure, renders a fixed error bubble instead
+   (with no raw answer/citations, since none exist). */
+async function sendMessage(){
+  const input = document.getElementById('chat-input');
+  const value = input.value.trim();
+  if(!value) return;
+
+  const targetLang = document.getElementById('lang-current').textContent.trim();
+  const activeFilter = document.querySelector('.filter-chip.active').dataset.filter;
+
+  addUserBubble(value);
+  input.value = '';
+  input.style.height = 'auto';
+  input.classList.remove('is-maxed');
+  const micBtnEl = document.getElementById('mic-btn');
+  if (micBtnEl) micBtnEl.style.display = '';
+  showTyping();
+
+  const formData = new FormData();
+  formData.append("session_id", sessionId);
+  formData.append("text_input", value);
+  formData.append("target_lang", targetLang);
+  formData.append("doc_filter", activeFilter);
+
+  try {
+    const response = await fetch('/api/v1/chat', {
+      method: 'POST',
+      body: formData
+    });
+
+    if(!response.ok) throw new Error("Network error communicating with gateway.");
+
+    const data = await response.json();
+
+    sessionId = data.session_id;
+    removeTyping();
+    addAssistantBubble(data.response_text, data.raw_answer, data.citations);
+
+  } catch (error) {
+    console.error("Backend API Error:", error);
+    removeTyping();
+    addAssistantBubble("Connection Error: Ensure your FastAPI server is running.", null, []);
+  }
+}
+
+document.getElementById('send-btn').addEventListener('click', sendMessage);
+
+/* ---------------- Mic Dictation ---------------- */
+/* See wiring map #3. #mic-btn toggles recording on/off via the 
+   browser's native MediaRecorder API (no backend involvement yet 
+   at this stage - the recorded audio only reaches the server once
+   #voice-preview-send -> sendAudioMessage() fires). */
+const micBtn = document.getElementById('mic-btn');
+const micStatus = document.getElementById('mic-status');
+const previewBar = document.getElementById('voice-preview-bar');
+const previewPlayBtn = document.getElementById('voice-preview-play');
+const previewCancelBtn = document.getElementById('voice-preview-cancel');
+const previewSendBtn = document.getElementById('voice-preview-send');
+
+let mediaRecorder = null;
+let audioChunks = [];
+let pendingAudioBlob = null;
+let previewAudioEl = null;
+
+micBtn.addEventListener('click', async () => {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+    mediaRecorder.onstop = () => {
+      stream.getTracks().forEach(t => t.stop());
+      micBtn.classList.remove('mic-recording');
+      micStatus.classList.add('hidden');
+      // Recorded as WebM/Opus - this exact blob type is what
+      // services/audio_handler.py's convert_to_wav() expects to receive
+      // and decode with format="webm" once it's actually sent.
+      pendingAudioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      previewAudioEl = new Audio(URL.createObjectURL(pendingAudioBlob));
+      previewBar.classList.remove('hidden');
+      previewBar.classList.add('flex');
+    };
+
+    mediaRecorder.start();
+    micBtn.classList.add('mic-recording');
+    micStatus.classList.remove('hidden');
+  } catch (err) {
+    console.error('Mic access denied or unavailable:', err);
+  }
+});
+
+previewPlayBtn.addEventListener('click', () => {
+  if (!previewAudioEl) return;
+  previewAudioEl.play();
+  previewPlayBtn.innerHTML = '<i data-lucide="pause" class="w-4.5 h-4.5"></i>';
+  lucide.createIcons();
+  previewAudioEl.onended = () => {
+    previewPlayBtn.innerHTML = '<i data-lucide="play" class="w-4.5 h-4.5"></i>';
+    lucide.createIcons();
+  };
+});
+
+previewCancelBtn.addEventListener('click', () => {
+  pendingAudioBlob = null;
+  previewAudioEl = null;
+  previewBar.classList.add('hidden');
+  previewBar.classList.remove('flex');
+});
+
+previewSendBtn.addEventListener('click', () => {
+  if (!pendingAudioBlob) return;
+  const blobToSend = pendingAudioBlob;
+  pendingAudioBlob = null;
+  previewAudioEl = null;
+  previewBar.classList.add('hidden');
+  previewBar.classList.remove('flex');
+  sendAudioMessage(blobToSend);
+});
+
+/* THE voice-message send path - mirrors sendMessage() above but sends
+   `audio_file` instead of `text_input` in the form data, and (unlike
+   sendMessage(), which renders the user bubble BEFORE the request)
+   waits for the /api/v1/chat response before rendering ANY bubble at
+   all, since it needs main.py's transcript (`data.user_message`) to
+   pass to addUserVoiceBubble(). */
+async function sendAudioMessage(audioBlob){
+  const targetLang = document.getElementById('lang-current').textContent.trim();
+  const activeFilter = document.querySelector('.filter-chip.active').dataset.filter;
+
+  showTyping();
+  const formData = new FormData();
+  formData.append("session_id", sessionId);
+  formData.append("audio_file", audioBlob, "recording.webm");
+  formData.append("target_lang", targetLang);
+  formData.append("doc_filter", activeFilter);
+
+  try {
+    const response = await fetch('/api/v1/chat', { method: 'POST', body: formData });
+    if(!response.ok) throw new Error("Network error communicating with gateway.");
+    const data = await response.json();
+    sessionId = data.session_id;
+    removeTyping();
+    addUserVoiceBubble(audioBlob, data.user_message);
+    addAssistantBubble(data.response_text, data.raw_answer, data.citations);
+  } catch (error) {
+    console.error("Backend API Error:", error);
+    removeTyping();
+    addAssistantBubble("Connection Error: Ensure your FastAPI server is running.", null, []);
+  }
+}
+
+/* ---------------- Language Dropdown ---------------- */
+/* See wiring map #4. #lang-btn opens/closes #lang-dropdown; each
+   .lang-option sets #lang-current's text (the actual value sent to the
+   backend on every request) and triggers a full retranslation batch of
+   every existing bubble via lockAndRetranslate(). */
+const langBtn = document.getElementById('lang-btn');
+const langDropdown = document.getElementById('lang-dropdown');
+const langLockIndicator = document.getElementById('lang-lock-indicator');
+
+// Guards against overlapping translation batches: without this, clicking
+// through Yoruba -> Hausa -> Igbo quickly fires three overlapping
+// retranslateAllBubbles() runs. Two real problems follow from that, not
+// just one - wasted Google/MyMemory calls for a language the user has
+// already moved on from, AND a race condition where slower responses
+// from an earlier-picked language can land AFTER a later pick's
+// responses, leaving some bubbles showing the wrong language. Locking
+// the dropdown for the duration of one retranslation batch prevents
+// both. A hard timeout is included so a stalled network request can
+// never leave the UI locked indefinitely.
+let isTranslating = false;
+const TRANSLATE_LOCK_TIMEOUT_MS = 45000;
+
+/* Toggles the "locked" UI state: disables #lang-btn and every
+   .lang-option (via their `disabled` attribute + the CSS
+   disabled:opacity-50 rules defined above), and shows/hides
+   #lang-lock-indicator. Called by lockAndRetranslate() before and after
+   its retranslateAllBubbles() call. */
+function setLangControlsLocked(locked){
+  isTranslating = locked;
+  langBtn.disabled = locked;
+  langLockIndicator.classList.toggle('hidden', !locked);
+  langLockIndicator.classList.toggle('flex', locked);
+  document.querySelectorAll('.lang-option').forEach(o => { o.disabled = locked; });
+}
+
+/* Wraps retranslateAllBubbles(targetLang) with the lock described above,
+   plus a hard TRANSLATE_LOCK_TIMEOUT_MS ceiling (via Promise.race) so a
+   stalled /api/v1/translate request can never leave the dropdown
+   disabled forever - the `finally` always unlocks the controls even if
+   the timeout, rather than the real translation batch, is what won the
+   race. */
+async function lockAndRetranslate(targetLang){
+  setLangControlsLocked(true);
+  try {
+    await Promise.race([
+      retranslateAllBubbles(targetLang),
+      new Promise(resolve => setTimeout(resolve, TRANSLATE_LOCK_TIMEOUT_MS))
+    ]);
+  } finally {
+    setLangControlsLocked(false);
+  }
+}
+
+langBtn.addEventListener('click', (e)=>{
+  e.stopPropagation();
+  if (isTranslating) return; // dropdown itself opens/closes normally, but stays inert mid-translation
+  const isHidden = langDropdown.classList.contains('hidden');
+  if(isHidden){
+    langDropdown.classList.remove('hidden');
+    requestAnimationFrame(()=>{ langDropdown.style.opacity='1'; langDropdown.style.transform='scale(1)'; });
+  } else {
+    closeLangDropdown();
+  }
+});
+function closeLangDropdown(){
+  langDropdown.style.opacity = '0';
+  langDropdown.style.transform = 'scale(0.95)';
+  setTimeout(()=> langDropdown.classList.add('hidden'), 180);
+}
+document.addEventListener('click', ()=> {
+  if(!langDropdown.classList.contains('hidden')) closeLangDropdown();
+});
+document.querySelectorAll('.lang-option').forEach(opt=>{
+  opt.addEventListener('click', (e)=>{
+    e.stopPropagation();
+    if (isTranslating) return; // ignore a second pick while one is still in flight
+    document.getElementById('lang-current').textContent = opt.dataset.lang;
+    document.querySelectorAll('.lang-option').forEach(o=>{
+      o.innerHTML = o.dataset.lang;
+      o.classList.remove('text-parchment');
+      o.classList.add('text-silver');
+    });
+    opt.innerHTML = opt.dataset.lang + ' <i data-lucide="check" class="w-3 h-3 text-gold"></i>';
+    opt.classList.remove('text-silver');
+    opt.classList.add('text-parchment', 'flex', 'items-center', 'justify-between');
+    lucide.createIcons();
+    closeLangDropdown();
+    lockAndRetranslate(opt.dataset.lang);
+  });
+});
+
+/* ---------------- Settings Dropdown ---------------- */
+/* #settings-btn opens/closes #settings-dropdown, which itself contains
+   #clear-chat-btn (client-side only - see its own comment in the markup
+   above) and #return-home-btn (-> goToWelcome()). */
+const settingsBtn = document.getElementById('settings-btn');
+const settingsDropdown = document.getElementById('settings-dropdown');
+
+document.getElementById('motion-status').textContent =
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'On (system)' : 'Off';
+
+settingsBtn.addEventListener('click', (e)=>{
+  e.stopPropagation();
+  const isHidden = settingsDropdown.classList.contains('hidden');
+  if(isHidden){
+    settingsDropdown.classList.remove('hidden');
+    settingsBtn.setAttribute('aria-expanded', 'true');
+    requestAnimationFrame(()=>{ settingsDropdown.style.opacity='1'; settingsDropdown.style.transform='scale(1)'; });
+  } else {
+    closeSettingsDropdown();
+  }
+});
+function closeSettingsDropdown(){
+  settingsDropdown.style.opacity = '0';
+  settingsDropdown.style.transform = 'scale(0.95)';
+  settingsBtn.setAttribute('aria-expanded', 'false');
+  setTimeout(()=> settingsDropdown.classList.add('hidden'), 180);
+}
+document.addEventListener('click', ()=> {
+  if(!settingsDropdown.classList.contains('hidden')) closeSettingsDropdown();
+});
+settingsDropdown.addEventListener('click', (e)=> e.stopPropagation());
+
+document.getElementById('clear-chat-btn').addEventListener('click', ()=>{
+  chatLog.innerHTML = '';
+  closeSettingsDropdown();
+});
+
+document.getElementById('return-home-btn').addEventListener('click', ()=>{
+  closeSettingsDropdown();
+  goToWelcome();
+});
+
+/* ---------------- Mobile status popover ---------------- */
+/* Mobile-only equivalent of the desktop status row in the header - builds 
+   and positions a small floating panel on click, removes it on a
+   second click (either on the button again, or anywhere else on the
+   page via the one-shot document listener at the end). Purely
+   decorative/static content, same as the desktop version - no backend
+   call. */
+document.getElementById('status-btn').addEventListener('click', (e)=>{
+  e.stopPropagation();
+  const existing = document.getElementById('mobile-status-pop');
+  if(existing){ existing.remove(); return; }
+  const pop = document.createElement('div');
+  pop.id = 'mobile-status-pop';
+  pop.className = 'glass-panel glow-border-purple rounded-xl p-3 fixed z-40 font-mono text-[11px] text-silver flex flex-col gap-1.5';
+  pop.style.top = (e.target.closest('button').getBoundingClientRect().bottom + 8) + 'px';
+  pop.style.right = '16px';
+  pop.innerHTML = `
+    <span class="flex items-center gap-1.5"><span class="status-dot bg-emerald-400"></span>Engine: Active</span>
+    <span class="flex items-center gap-1.5"><span class="status-dot bg-brass-400"></span>Pinecone DB: Connected</span>
+    <span class="flex items-center gap-1.5"><span class="status-dot bg-purple-400"></span>TTS: In-Memory</span>`;
+  document.body.appendChild(pop);
+  document.addEventListener('click', function handler(){ pop.remove(); document.removeEventListener('click', handler); }, {once:true});
+});
+</script>
+
+</body>
+</html>

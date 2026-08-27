@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Python Package Manager / Local Builds
+.uv/
+
+# OS-specific files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# IDE specific folders (VS Code / Windsurf)
+.vscode/
+.history/
