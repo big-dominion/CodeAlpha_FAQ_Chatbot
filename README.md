@@ -4,7 +4,7 @@
 
 DOMINION LexOracle is a legal question answering tool for Nigerian statutory law. You ask it a question in plain English (or Yoruba, Hausa, Igbo, or French), and it searches through six real Nigerian legal documents, finds the sections that actually answer your question, and gives you an answer that quotes those exact sections. It never makes up an answer from general knowledge. If the statutes do not cover something, it says so directly.
 
-Live demo: [Pending Deployment] 
+**Live demo:** https://dominion-lexoracle.onrender.com/ 
 
 ## Table of Contents
 
@@ -78,14 +78,15 @@ A few design choices in this project were made on purpose, and it helps to under
 ## Tech Stack
 
 ### Backend
-
 - Python 3.12
 - FastAPI: the web framework that serves the API and the page
 - Uvicorn: the server that runs the FastAPI app
 - Groq: the AI provider used for query expansion and answer generation (model: openai/gpt-oss-120b)
 - Pinecone: the vector database that stores and searches the statute text, using its multilingual-e5-large embedding model
 - pypdf: used to pull the text out of the source PDFs during ingestion
-- deep-translator: wraps GoogleTranslator (primary) and MyMemoryTranslator (failover) for answer translation
+- deep-translator: the routing library used to handle translation requests
+- Google Translate: the primary translation engine used for multilingual support
+- MyMemory: the automatic failover translation engine used when Google Translate is unavailable
 - gTTS: used to turn text into spoken audio
 - SpeechRecognition, pydub, and imageio-ffmpeg: used together to turn a recorded voice question into text
 - slowapi: used to limit how many requests one person can make per minute
