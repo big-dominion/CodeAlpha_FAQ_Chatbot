@@ -60,12 +60,33 @@ The module also fails fast at import time if required API keys
 (`GROQ_API_KEY`, `PINECONE_API_KEY`) aren't set in the environment,
 rather than starting up successfully and only failing later, confusingly,
 on the first real request that needs them.
+
+PROMPT-INJECTION / DRIFT DEFENSE (added):
+This file now carries the second and third layers of a four-layer
+defense against a user trying to get the model to produce code, SQL,
+screenplay/roleplay content, or a leak of its own system prompt - the
+first and second layers (the system prompt's ABSOLUTE BOUNDARIES block,
+and the Groq `stop` sequences on the final answer call) live in
+services/rag.py, since they need to sit next to the prompt and the Groq
+call itself. This file adds:
+  - `looks_suspicious` / `DRIFT_INTENT_SIGNALS`: a cheap, regex-only,
+    logging-only triage check run on the INCOMING user message, before
+    query_lex_oracle is even called. It never blocks anything - see its
+    own comment for why a false positive here should cost nothing.
+  - `contains_drift` / `DRIFT_PATTERNS`: a regex check run on the
+    OUTGOING raw_answer, which is the backstop layer - it doesn't care
+    how the model was tricked, only what actually came out, and it
+    substitutes a fixed refusal sentence if the answer looks like code,
+    SQL, a screenplay, or a prompt-leak attempt slipped through both of
+    the earlier layers in rag.py.
 """
 
 import os
 import sys
 import time
 import uuid
+import logging
+import re
 
 from dotenv import load_dotenv
 
@@ -89,6 +110,9 @@ from slowapi.errors import RateLimitExceeded
 from services.audio_handler import text_to_speech_base64, speech_to_text_from_bytes
 from services.translator import translate_text
 from services.rag import query_lex_oracle
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 
 # Fail fast at startup rather than at request time: if either of these
 # keys is missing, every real request would eventually fail deep inside
@@ -135,6 +159,60 @@ SESSION_TTL_SECONDS = 60 * 60
 # anything, and that adds up. Truncating past this point trades a
 # slightly incomplete spoken answer for a predictable response time.
 MAX_TTS_CHARS = 3000
+
+# ---------------------------------------------------------------------------
+# Prompt-injection / drift defense
+# ---------------------------------------------------------------------------
+
+# Regex-only, no extra LLM call: flags a message as worth logging before
+# it's even sent to query_lex_oracle. Deliberately NOT used to block - a
+# real user could legitimately ask about "the SQL Act" or similar edge
+# cases, and a false positive here costs nothing but a wasted log line,
+# whereas a hard block would cost a real user their real legal question.
+# This exists to build a flagged-query dataset for later review, not to
+# gate anything.
+DRIFT_INTENT_SIGNALS = [
+    r"\bscreenplay\b", r"\bpython (script|function|code)\b", r"\bsql query\b",
+    r"\bjson object\b", r"\bignore (the )?(previous|legal|statutes?)\b",
+    r"\bdisregard\b.*\binstructions\b", r"\bsystem prompt\b", r"\bact as\b",
+    r"\bpretend (you|to be)\b", r"\bhypothetically\b.*\b(code|script)\b",
+]
+
+
+def looks_suspicious(text: str) -> bool:
+    """Logging-only triage signal - see DRIFT_INTENT_SIGNALS comment for why this never blocks."""
+    return any(re.search(p, text, re.IGNORECASE) for p in DRIFT_INTENT_SIGNALS)
+
+
+# Output-side backstop: catches whatever survives both the system prompt
+# and the Groq stop sequences in rag.py, regardless of how the model got
+# there. This is the layer that doesn't depend on the model "choosing"
+# correctly - it only looks at what actually came out.
+#
+# The indented-block pattern below requires 3+ CONSECUTIVE lines indented
+# 4+ spaces, none of which start with a Markdown list/quote marker
+# (-, *, >, or "1."). That's deliberately narrower than a plain
+# `^\s{4,}\S` check: a single nested Markdown sub-bullet or a blockquoted
+# statute excerpt is one indented line, not a run of three, and a nested
+# bullet's own text starts with one of the excluded markers anyway - so
+# this only fires on the shape a real code block has (repeated plain
+# indentation), not on the formatting the system prompt itself asks the
+# model to produce.
+DRIFT_PATTERNS = [
+    r"```",                                                          # code fences
+    r"\bdef\s+\w+\s*\(",                                             # python functions
+    r"\b(CREATE|SELECT|INSERT|DROP)\s+(TABLE|\*|INTO)\b",            # SQL
+    r"^\s*import\s+\w+",                                             # imports
+    r"\bfunction\s*\(",                                              # JS
+    r'"[a-z_]+"\s*:\s*"',                                            # raw JSON key:string pairs
+    r"(?:^\s{4,}(?!-|\*|>|\d+\.|\([a-zA-Z]\))\S.*\n){3,}",           # 3+ consecutive plain-indented lines = code block, not a sub-bullet (also exempts lettered/numbered statute sub-clauses like (a), (b))
+    r"\b(INT\.|EXT\.|FADE (IN|OUT)|PROSECUTOR|JUDGE)\b",              # screenplay markers
+    r"\bmy (system prompt|instructions were|instructions are)\b",    # prompt leak attempt
+]
+
+
+def contains_drift(text: str) -> bool:
+    return any(re.search(p, text, re.IGNORECASE | re.MULTILINE) for p in DRIFT_PATTERNS)
 
 
 def touch_session(session_id: str):
@@ -270,6 +348,9 @@ async def chat_endpoint(
     - If there's still no usable message at all (empty text, and either
       no audio was sent or the transcription came back empty), return a
       400 error immediately rather than proceeding with nothing to answer.
+    - Log (never block on) a suspicious-intent signal against the
+      resolved message via `looks_suspicious` - see that function's
+      comment for why this is logging-only.
     - Append the user's message to this session's history as a
       {"role": "user", ...} entry - this mutates the same list object
       touch_session returned, which lives inside chat_sessions.
@@ -279,7 +360,11 @@ async def chat_endpoint(
     - If the raw answer came back empty/blank (can genuinely happen after
       a very short or unclear voice recording, or an LLM hiccup),
       substitute a friendly fallback message asking the user to rephrase,
-      rather than sending an empty bubble to the frontend.
+      rather than sending an empty bubble to the frontend. Otherwise, if
+      the raw answer matches `contains_drift` (a code/SQL/screenplay/
+      prompt-leak shape slipped past both defense layers in rag.py),
+      substitute a fixed refusal sentence instead - this is the output-
+      side backstop described in the module docstring.
     - Translate the answer for display, only if `target_lang` is NOT an
       English variant (per `_is_english_variant`) - otherwise
       `final_answer` stays exactly equal to the raw English answer, with
@@ -314,6 +399,9 @@ async def chat_endpoint(
     if not user_message:
         return JSONResponse({"error": "No input detected"}, status_code=400)
 
+    if looks_suspicious(user_message):
+        logger.warning(f"Suspicious query flagged: {user_message!r}")
+
     history.append({"role": "user", "content": user_message})
 
     response_data = query_lex_oracle(user_message, doc_filter, history)
@@ -324,6 +412,8 @@ async def chat_endpoint(
     # message instead of a real sentence.
     if not raw_answer or not raw_answer.strip():
         raw_answer = "I wasn't able to generate a response to that. Could you rephrase your question?"
+    elif contains_drift(raw_answer):
+        raw_answer = "I can only provide statutory legal information from the source documents, and can't generate code, scripts, structured data formats, or fictional/roleplay content."
 
     citations = response_data.get("citations", [])
 
