@@ -29,6 +29,20 @@ correct per-piece method, but ONLY for that one request instead of every
 request. See `_structure_preserved` for the exact check, and
 `_translate_text_uncached` for where the two paths are stitched together.
 
+CONCURRENCY (added): the slow path used to translate every line one at a
+time, in a plain `for` loop - a legal answer with several headers and a
+table regularly has 15-30+ lines/cells needing their own network round
+trip, and translating them sequentially meant paying the full latency of
+every single one, back to back, before the answer was ready (observed in
+practice taking many seconds for a single answer). Since each of these is
+a blocking network call and not CPU work, they don't need to happen one
+after another - `_translate_text_uncached`'s slow path now fires all of a
+line's translations at once across a small thread pool
+(`_SLOW_PATH_MAX_WORKERS`) and waits for them together, so the wall-clock
+cost is roughly the slowest single call rather than the sum of all of
+them. See the comment above `_mymemory_lock` for how the MyMemory
+per-second rate limit is still respected under this concurrency.
+
 Everything else - bold-stripping, typographic normalization, MyMemory's
 garbage-result detection, the whole-answer-reverts-to-English-on-any-piece-
 failure guarantee, and the translation cache - is unchanged from before.
@@ -36,7 +50,9 @@ failure guarantee, and the translation cache - is unchanged from before.
 import logging
 import os
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from deep_translator import GoogleTranslator, MyMemoryTranslator
 
 logger = logging.getLogger(__name__)
@@ -56,6 +72,16 @@ MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 # 450 leaves some room below that hard limit, so a line that is close to
 # the edge does not get rejected by a small miscount.
 MYMEMORY_CHUNK_LIMIT = 450
+
+# How many lines/cells the slow path translates at once. Each unit is a
+# blocking network call, not CPU work, so this is deliberately modest
+# rather than "as many as there are lines" - Google's scrape endpoint is
+# unofficial and has no documented concurrency allowance, so a small pool
+# (a handful of simultaneous requests) gets most of the latency win
+# without looking like a burst that risks a temporary block. MyMemory
+# calls made from inside this pool are still paced to its real per-second
+# cap by `_mymemory_lock` below, independent of this worker count.
+_SLOW_PATH_MAX_WORKERS = 6
 
 # Caches a completed translation by the exact (english_text, target_lang)
 # pair that produced it. This exists specifically because the same
@@ -87,17 +113,30 @@ def _cache_key(text: str, target_lang: str) -> tuple:
 # that per-second cap if nothing paces them. _throttle_mymemory is called
 # immediately before every MyMemory request and sleeps just long enough
 # to keep consecutive calls at least this far apart.
+#
+# _mymemory_lock makes this safe now that multiple slow-path lines can
+# reach _translate_one_piece_mymemory from different threads at once
+# (see _SLOW_PATH_MAX_WORKERS above): without the lock, two threads could
+# both read the same stale _last_mymemory_call_at, both compute a "wait"
+# based on it, and both fire immediately after their own sleep - letting
+# concurrency quietly defeat the pacing this function exists to enforce.
+# The lock only serializes the MyMemory dispatch moment itself (read
+# last-call-time, sleep if needed, update last-call-time); it does not
+# serialize Google calls, which make up the large majority of slow-path
+# traffic and are unaffected by this.
 _MYMEMORY_MIN_INTERVAL_SECONDS = 0.22
 _last_mymemory_call_at = 0.0
+_mymemory_lock = threading.Lock()
 
 
 def _throttle_mymemory():
     global _last_mymemory_call_at
-    now = time.monotonic()
-    wait = _MYMEMORY_MIN_INTERVAL_SECONDS - (now - _last_mymemory_call_at)
-    if wait > 0:
-        time.sleep(wait)
-    _last_mymemory_call_at = time.monotonic()
+    with _mymemory_lock:
+        now = time.monotonic()
+        wait = _MYMEMORY_MIN_INTERVAL_SECONDS - (now - _last_mymemory_call_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_mymemory_call_at = time.monotonic()
 
 
 # Substring MyMemory's own rate-limit error message contains, regardless
@@ -435,6 +474,14 @@ def _translate_line_preserving_structure(line: str, lang_code: str) -> str:
     Routes one line through whichever handling keeps its Markdown
     structure intact: table rows cell-by-cell, headers with their "#"
     prefix split off and reattached, everything else as one plain run.
+
+    Called once per non-trivial line from the slow path in
+    _translate_text_uncached, potentially from several worker threads at
+    once - see _SLOW_PATH_MAX_WORKERS. This function and everything it
+    calls (_translate_run, _translate_table_row, _translate_one_piece_mymemory)
+    touch no shared mutable state directly, so no locking is needed here;
+    the only shared state on this path is the MyMemory throttle, which
+    guards itself via _mymemory_lock.
     """
     stripped_line = line.strip()
 
@@ -489,12 +536,20 @@ def _translate_text_uncached(text: str, lang_code: str) -> str:
     own fallback. If ANY piece fails on both engines, the whole answer
     reverts to English rather than shipping a mixed-language result.
 
+    Every non-trivial line's translation is dispatched to a small thread
+    pool up front (see _SLOW_PATH_MAX_WORKERS and the module docstring's
+    "CONCURRENCY" section) instead of one line at a time, so the total
+    wait is close to the slowest single line rather than the sum of every
+    line. Blank lines and table separator rows are never submitted to the
+    pool at all - there's nothing in them to translate, so they're just
+    copied straight into the result in their original position.
+
     This means the person gets the fast single-call speed whenever
     Google happens to preserve the Markdown correctly, and only pays the
-    slower per-piece cost on the specific answers where it doesn't -
-    instead of either always risking a broken table (old fast-only
-    version) or always paying the per-piece cost even when it wasn't
-    needed (old slow-only version).
+    slower per-piece cost - now parallelized - on the specific answers
+    where it doesn't, instead of either always risking a broken table
+    (old fast-only version) or always paying the full sequential
+    per-piece cost even when it wasn't needed (old slow-only version).
     """
     clean_text = _strip_bold_markers(text)
     clean_text = _normalize_typographic_chars(clean_text)
@@ -516,29 +571,50 @@ def _translate_text_uncached(text: str, lang_code: str) -> str:
     except Exception as e:
         logger.warning(f"Whole-answer Google translation raised, falling back to the slower path. Error: {e}")
 
-    # STEP 2: slow but safe path.
+    # STEP 2: slow but safe path - now parallelized across lines/cells.
     lines = clean_text.split("\n")
-    translated_lines = []
+    translated_lines = [None] * len(lines)
+    work_items = []  # (index, line) pairs that actually need translation
 
+    for i, line in enumerate(lines):
+        stripped_line = line.strip()
+
+        if not stripped_line or _TABLE_SEPARATOR_RE.match(stripped_line):
+            # Nothing to translate - passed through untouched, and never
+            # submitted to the thread pool below.
+            translated_lines[i] = line
+        else:
+            work_items.append((i, line))
+
+    if not work_items:
+        return "\n".join(translated_lines)
+
+    executor = ThreadPoolExecutor(max_workers=min(_SLOW_PATH_MAX_WORKERS, len(work_items)))
     try:
-        for line in lines:
-            stripped_line = line.strip()
-
-            if not stripped_line:
-                translated_lines.append(line)
-                continue
-
-            if _TABLE_SEPARATOR_RE.match(stripped_line):
-                translated_lines.append(line)
-                continue
-
-            translated_lines.append(_translate_line_preserving_structure(line, lang_code))
+        futures = {
+            executor.submit(_translate_line_preserving_structure, line, lang_code): i
+            for i, line in work_items
+        }
+        for future in futures:
+            i = futures[future]
+            # .result() re-raises _PieceTranslationFailed here if that
+            # particular line's translation failed on both engines - the
+            # except block below catches it and reverts the whole answer
+            # to English, same guarantee as the old sequential loop had.
+            translated_lines[i] = future.result()
     except _PieceTranslationFailed:
         logger.warning(
             "A piece could not be translated by either engine during the "
             "slow path - returning the answer in English rather than a "
             "mixed-language result."
         )
+        # Any other lines still running in the pool are no longer needed
+        # once we've decided to revert the whole answer to English -
+        # cancel_futures skips them instead of waiting for them to finish
+        # before this function can return.
+        executor.shutdown(wait=False, cancel_futures=True)
         return text
+    else:
+        executor.shutdown(wait=True)
 
     return "\n".join(translated_lines)
