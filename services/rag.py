@@ -68,10 +68,14 @@ they don't need direct access to the prompt or the Groq call):
     caught the request when asked for directly, not when the same request
     arrived wrapped in a container.
   - The final-answer Groq call's `stop` sequences physically halt
-    generation the instant the model starts emitting a code/SQL/
-    screenplay shape, independent of whether the prompt held - this is
-    what stops a partially-successful jailbreak from completing even if
-    layer one didn't fully prevent it from starting.
+    generation the instant the model starts emitting a code/SQL shape,
+    independent of whether the prompt held - this is what stops a
+    partially-successful jailbreak from completing even if layer one
+    didn't fully prevent it from starting. Capped at 4 entries (Groq
+    rejects a longer `stop` list with a 400) - screenplay markers live
+    only in main.py's output-regex backstop now, not in this list; see
+    the inline comment above the Groq call for the incident that made
+    this cap matter in practice.
 
 If you're extending this file: `query_lex_oracle(query, doc_filter,
 history)` is the single public entry point other modules should call.
@@ -382,12 +386,24 @@ Regardless of the language used in the user's prompt (whether Yoruba, Hausa, Igb
             seed=GROQ_SEED,
             # Cheap, deterministic backstop against the ABSOLUTE BOUNDARIES
             # prompt block above getting bypassed: generation halts the
-            # instant the model starts emitting a code/SQL/screenplay
-            # shape, regardless of what led it there. See the module
-            # docstring's "PROMPT-INJECTION / DRIFT DEFENSE" section for
-            # how this fits with the other three layers (the prompt block
-            # above, and the input-triage/output-regex layers in main.py).
-            stop=["```", "\ndef ", "CREATE TABLE", "\nimport ", "SELECT * FROM", "INT. ", "FADE IN", "FADE OUT"]
+            # instant the model starts emitting a code/SQL shape,
+            # regardless of what led it there. See the module docstring's
+            # "PROMPT-INJECTION / DRIFT DEFENSE" section for how this fits
+            # with the other three layers (the prompt block above, and the
+            # input-triage/output-regex layers in main.py).
+            #
+            # Capped at 4 entries because Groq's API rejects a `stop` list
+            # longer than 4 with a 400 error (confirmed in production: an
+            # earlier 8-item list silently sent every single chat request
+            # into the except block below for the whole time it was live,
+            # since the exception was caught and replaced with the fixed
+            # "System Error" message rather than propagating loudly).
+            # Screenplay markers ("INT. ", "FADE IN", "FADE OUT") were cut
+            # from this list to make room, not from the defense overall -
+            # main.py's contains_drift regex backstop still catches them,
+            # just one step later (after generation completes, via
+            # substitution, instead of an early halt mid-generation).
+            stop=["```", "\ndef ", "CREATE TABLE", "SELECT * FROM"]
         )
         raw_answer = response.choices[0].message.content
 
