@@ -378,6 +378,14 @@
     below - marked's tables come out as plain <table> elements, so this
     wrapper is added at render time in renderMarkdown(), not in raw HTML
     here. */
+  .table-scroll-wrap{
+      position:relative;
+      overflow-x:auto;
+      -webkit-overflow-scrolling:touch;
+      max-width:100%;
+      width:100%;
+      margin-bottom:0.8em;
+  }
   .table-scroll-wrap::after{
       content:'';
       position:sticky;
