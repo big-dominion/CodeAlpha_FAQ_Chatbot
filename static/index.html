@@ -261,8 +261,12 @@
     border:1px solid rgba(139,92,246,0.3);
   }
   .bubble-assistant{
-    background:linear-gradient(135deg, rgba(30,41,59,0.9), rgba(15,23,42,0.9));
-    border:1px solid rgba(198,168,118,0.18);
+      background:linear-gradient(135deg, rgba(30,41,59,0.9), rgba(15,23,42,0.9));
+      border:1px solid rgba(198,168,118,0.18);
+      min-width:0;
+  }
+  .answer-text{
+      min-width:0;
   }
 
   /* The clickable citation pills built by citationPillHTML() - clicking
@@ -379,6 +383,8 @@
     overflow-x:auto;
     -webkit-overflow-scrolling:touch;
     margin-bottom:0.8em;
+    max-width:100%;   /* never grow past the bubble it sits in */
+    width:100%;
   }
   .table-scroll-wrap::after{
     content:'';
@@ -396,7 +402,7 @@
       border-collapse:collapse;
       table-layout:auto;
       width:max-content;
-      max-width:none;
+      max-width:none;   /* the TABLE can still be wider than its wrapper - that's what makes it scroll */
       font-size:0.85em;
       margin-bottom:0;
   }
