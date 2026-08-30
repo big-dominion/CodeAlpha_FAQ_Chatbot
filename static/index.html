@@ -162,11 +162,10 @@
     --silver:#94A3B8;
   }
   html,body{
-      background:var(--slate-950);
-      color:var(--parchment);
-      font-family:'Inter',sans-serif;
-      overscroll-behavior:none;
-      overflow-x:hidden;
+    background:var(--slate-950);
+    color:var(--parchment);
+    font-family:'Inter',sans-serif;
+    overscroll-behavior:none;
   }
   .font-display{font-family:'Spectral',serif;}
   .font-mono{font-family:'JetBrains Mono',monospace;}
@@ -275,6 +274,7 @@
   .citation-pill{
     transition:background .18s ease, border-color .18s ease, transform .12s ease;
     white-space:nowrap;
+    flex-shrink:0;
   }
   .citation-pill:hover{background:rgba(198,168,118,0.18);border-color:rgba(198,168,118,0.55);transform:translateY(-1px);}
   .citation-pill:focus-visible{outline:2px solid var(--gold);outline-offset:2px;}
@@ -1335,7 +1335,7 @@ function addAssistantBubble(text, rawAnswer, citations, displayLang){
       <div class="min-w-0 flex-1">
         <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-2.5">
           <div class="answer-text text-sm text-parchment leading-relaxed">${renderMarkdown(text)}</div>
-          <div class="flex flex-wrap gap-1.5 mt-0.5">${pillsHTML}</div>
+          <div class="flex gap-1.5 mt-0.5 overflow-x-auto scrollbar-thin pb-1">${pillsHTML}</div>
         </div>
         <div class="flex items-center gap-3 mt-1.5">
           <button class="listen-btn flex items-center gap-1.5 text-[11px] text-silver hover:text-gold transition-colors" data-raw-answer="${encodeURIComponent(rawAnswer || text)}">
