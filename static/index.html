@@ -1093,13 +1093,19 @@ function renderMarkdown(text){
 /* CHANGED: now also strips headers, table pipes/separator rows, and
    horizontal rules, since the model's answers can contain all of these
    now - not just **bold** and "* " bullets like before. Without this,
-   gTTS would read "hash hash hash" and pipe characters aloud. */
+   gTTS would read "hash hash hash" and pipe characters aloud.
+   ADDED: also strips raw HTML tags (e.g. <br>) that survive into the
+   raw answer text - marked/DOMPurify render these invisibly on screen,
+   but gTTS has no HTML parser, so without this line it reads the
+   literal tag characters aloud ("less than bridge greater than"). */
 /* Called only from playAudio(), right before the text is sent to
    POST /api/v1/tts (see wiring map #5) - this is the ONE place in the
    file that prepares text for SPEECH rather than for on-screen
    rendering; renderMarkdown() above is used for every other case. */
 function stripMarkdownForSpeech(text){
   return String(text)
+    .replace(/<br\s*\/?>/gi, '. ')                   // <br> tags -> spoken pause
+    .replace(/<\/?[a-z][^>]*>/gi, '')                // strip any other stray HTML tags
     .replace(/^#{1,6}\s+/gm, '')                    // drop heading markers
     .replace(/\*\*(.+?)\*\*/g, '$1')                 // **bold** -> bold
     .replace(/(^|\n)[-*]\s+/g, '$1')                 // drop leading bullet markers
