@@ -378,25 +378,22 @@
     below - marked's tables come out as plain <table> elements, so this
     wrapper is added at render time in renderMarkdown(), not in raw HTML
     here. */
-  .table-scroll-wrap{
-    position:relative;
-    overflow-x:auto;
-    -webkit-overflow-scrolling:touch;
-    margin-bottom:0.8em;
-    max-width:100%;   /* never grow past the bubble it sits in */
-    width:100%;
-  }
   .table-scroll-wrap::after{
-    content:'';
-    position:absolute;
-    top:0; right:0; bottom:0;
-    width:24px;
-    background:linear-gradient(to right, transparent, rgba(15,23,42,0.85));
-    pointer-events:none;
+      content:'';
+      position:sticky;
+      float:right;
+      top:0;
+      right:0;
+      height:100%;
+      width:24px;
+      margin-left:-24px;
+      background:linear-gradient(to right, transparent, rgba(15,23,42,0.85));
+      pointer-events:none;
+      display:block;
   }
   .table-scroll-wrap.scrolled-end::after{
-    opacity:0; /* hide the fade once the user has scrolled to the end - nothing left to hint at */
-    transition:opacity .2s ease;
+      opacity:0;
+      transition:opacity .2s ease;
   }
   .markdown-body table{
       border-collapse:collapse;
@@ -711,11 +708,11 @@
     </div>
 
     <footer class="text-center pb-3 pt-1">
-      <p class="text-[10px] text-silver/70 font-mono px-4">
-        Engineered with FastAPI, Groq, Pinecone, gTTS and deep-translator : CodeAlpha AI Project
-      </p>
       <p class="text-[10px] text-silver/70 font-mono px-4 mb-1">
         Research tool only. Not a substitute for legal advice.
+      </p>
+      <p class="text-[10px] text-silver/70 font-mono px-4">
+        Engineered with FastAPI, Groq, Pinecone, gTTS and deep-translator : CodeAlpha AI Project
       </p>
     </footer>
   </div>
@@ -1562,10 +1559,13 @@ function showTyping(){
       <div class="w-7 h-7 rounded-full bg-gradient-to-br from-brass-500 to-purple-500 flex-shrink-0 flex items-center justify-center mt-0.5">
         <i data-lucide="scale" class="w-3.5 h-3.5 text-slate-950"></i>
       </div>
-      <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-1">
-        <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
-        <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
-        <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+      <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-3 flex items-center gap-2">
+        <span class="text-xs text-silver">LexOracle is thinking</span>
+        <span class="flex items-center gap-1">
+          <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+          <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+          <span class="typing-dot w-1.5 h-1.5 rounded-full bg-silver"></span>
+        </span>
       </div>
     </div>`;
   chatLog.appendChild(row);
