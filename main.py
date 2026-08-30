@@ -108,7 +108,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from services.audio_handler import text_to_speech_base64, speech_to_text_from_bytes
-from services.translator import translate_text
+from services.translator import translate_text, translate_many
 from services.rag import query_lex_oracle
 
 logger = logging.getLogger(__name__)
@@ -543,3 +543,32 @@ async def translate_endpoint(request: Request, body: TranslateRequest):
         display_text = translate_text(text, target_lang=body.lang)
 
     return {"display_text": display_text}
+
+# Request body shape for POST /api/v1/translate/batch.
+class TranslateBatchRequest(BaseModel):
+    texts: list[str]
+    lang: str = "English"
+
+
+@app.post("/api/v1/translate/batch")
+@limiter.limit("15/minute")
+async def translate_batch_endpoint(request: Request, body: TranslateBatchRequest):
+    """
+    Translates multiple independent texts (e.g. every visible chat bubble)
+    in ONE request, instead of the frontend firing one /api/v1/translate
+    call per bubble. See services/translator.py's translate_many() for why
+    this matters for MyMemory's rate limit specifically - registering
+    MYMEMORY_EMAIL raises the daily word quota, but does NOT raise the
+    flat 5-requests/second cap, which is what several bubbles' worth of
+    concurrent slow-path translation bursts were actually hitting.
+
+    Detailed flow:
+    - Delegates directly to translate_many(body.texts, body.lang), which
+      handles the cache check, shared thread pool, and MyMemory throttle
+      coordination across the whole batch.
+    - Returns the translations in the SAME ORDER as the input texts list,
+      so the frontend can zip them back onto whichever bubbles it built
+      the request from by index.
+    """
+    translations = translate_many(body.texts, body.lang)
+    return {"translations": translations}

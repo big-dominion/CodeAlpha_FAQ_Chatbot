@@ -20,7 +20,7 @@
      JSON's `response_text` (translated) and `raw_answer` (always English)
      are both handed to addAssistantBubble(), which renders one with
      Markdown and stashes the other in a data-attribute for later reuse
-     by Listen/re-translate.
+     by Listen/translate.
 
   3. SENDING A MESSAGE (voice)
      #mic-btn starts/stops a MediaRecorder -> on stop, the recorded blob
@@ -36,13 +36,28 @@
      #lang-current's text (this text IS the `target_lang` value sent on
      every future /api/v1/chat, /api/v1/tts, and /api/v1/translate call -
      there's no separate language code stored anywhere in the frontend)
-     and calls lockAndRetranslate(), which calls retranslateAllBubbles()
-     for every existing answer bubble via POST /api/v1/translate
-     (text-only, no audio - see main.py's translate_endpoint). The
-     #lang-lock-indicator / disabled dropdown state exists so a second
-     language pick can't fire while the first batch of translate calls is
-     still in flight - see the long comment near isTranslating further
-     down in the script for why that race actually mattered in practice.
+     and calls markBubblesStale(), which walks every existing assistant
+     bubble and compares its stored row.dataset.displayLang against the
+     newly-picked language. Bubbles already in that language are left
+     alone; bubbles that are NOT are marked stale and have their
+     per-bubble "Translate this" button revealed - NO network calls fire
+     automatically on a language switch. See wiring map #4a below.
+
+  4a. PER-BUBBLE TRANSLATION
+     Each assistant bubble tracks the language it's currently displayed
+     in via row.dataset.displayLang (set when the bubble is created, and
+     updated whenever it's actually translated). Switching the global
+     language dropdown never re-translates anything by itself - it only
+     calls markBubblesStale(), which reveals a small "Translate this"
+     button (.translate-btn) on any bubble whose displayLang no longer
+     matches the newly-selected language. A single delegated click
+     listener on #chat-log handles clicks on any .translate-btn (including
+     ones on bubbles created after page load): it POSTs the bubble's
+     stored raw English answer to /api/v1/translate for row.dataset.pendingLang,
+     swaps in the translated text, updates row.dataset.displayLang, hides
+     the button again, and resets that bubble's Listen/audio-cache state
+     (since any previously cached audio was for the old language). This
+     replaces the old auto-retranslate-everything behavior entirely.
 
   5. LISTEN / AUDIO PLAYBACK
      Each assistant bubble's .listen-btn carries the ORIGINAL raw English
@@ -58,7 +73,9 @@
      Markdown that the translate call just rendered. Playback state
      (which language's audio is cached, and the play/pause toggle) is
      stashed directly on the button element via `btn._audioEl` /
-     `btn._audioLang` / `btn.dataset.playing`.
+     `btn._audioLang` / `btn.dataset.playing`. When playAudio() succeeds,
+     it also updates row.dataset.displayLang for that bubble, same as the
+     per-bubble Translate button does.
 
   6. CITATIONS
      Each citation returned in a /api/v1/chat response becomes both a
@@ -96,7 +113,10 @@
   directly - every one of those integrations lives behind the three
   FastAPI routes in main.py (/api/v1/chat, /api/v1/tts,
   /api/v1/translate), which is the complete list of backend endpoints
-  this page ever calls.
+  this page ever calls. (/api/v1/translate/batch also still exists in the
+  backend but is no longer called from this page - see wiring map #4a -
+  it's kept around in case a future opt-in "Translate all" bulk action is
+  added.)
 -->
 <html lang="en">
 <head>
@@ -591,16 +611,11 @@
           <!-- #lang-btn toggles #lang-dropdown open/closed; #lang-current
                holds the actual language string sent to the backend on
                every request (see wiring map #4). -->
-          <button id="lang-btn" class="flex items-center gap-1.5 text-xs text-silver hover:text-parchment border border-white/10 rounded-full px-3 py-1.5 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+          <button id="lang-btn" class="flex items-center gap-1.5 text-xs text-silver hover:text-parchment border border-white/10 rounded-full px-3 py-1.5 transition-colors">
             <i data-lucide="globe" class="w-3.5 h-3.5"></i>
             <span id="lang-current">English (US)</span>
             <i data-lucide="chevron-down" class="w-3 h-3"></i>
           </button>
-          <!-- #lang-lock-indicator: shown/hidden by setLangControlsLocked()
-               while a retranslateAllBubbles() batch is in flight. -->
-          <span id="lang-lock-indicator" class="hidden items-center gap-1 text-[10px] text-gold font-mono">
-            <i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i> Translating…
-          </span>
           <div id="lang-dropdown" class="lang-dropdown hidden absolute bottom-full mb-2 left-0 glass-panel glow-border-purple rounded-xl py-1.5 w-56 z-40 opacity-0 scale-95">
             <p class="px-3.5 pt-1.5 pb-1 text-[10px] uppercase tracking-wide text-silver/60">English accent</p>
             <!-- Each .lang-option's data-lang is exactly the string that
@@ -609,14 +624,14 @@
                  strings must match what services/audio_handler.py's
                  LANG_CODE_MAP / ENGLISH_TLDS and services/translator.py's
                  lang_map expect on the backend. -->
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-parchment hover:bg-white/5 flex items-center justify-between disabled:opacity-40 disabled:cursor-not-allowed" data-lang="English (US)">English (US) <i data-lucide="check" class="w-3 h-3 text-gold"></i></button>
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="English (UK)">English (UK)</button>
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="English (Nigeria)">English (Nigeria)</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-parchment hover:bg-white/5 flex items-center justify-between" data-lang="English (US)">English (US) <i data-lucide="check" class="w-3 h-3 text-gold"></i></button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5" data-lang="English (UK)">English (UK)</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5" data-lang="English (Nigeria)">English (Nigeria)</button>
             <p class="px-3.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-silver/60 border-t border-white/5 mt-1">Language</p>
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="Yoruba">Yoruba</button>
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="Hausa">Hausa</button>
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="Igbo">Igbo</button>
-            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed" data-lang="French">French</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5" data-lang="Yoruba">Yoruba</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5" data-lang="Hausa">Hausa</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5" data-lang="Igbo">Igbo</button>
+            <button class="lang-option w-full text-left px-3.5 py-2 text-xs text-silver hover:bg-white/5" data-lang="French">French</button>
           </div>
         </div>
         <span id="translate-source" class="text-[10px] text-silver font-mono">Google Translate, MyMemory fallback</span>
@@ -634,7 +649,7 @@
                the try/catch block near the top of the script. -->
           <textarea id="chat-input" rows="1" placeholder="Ask about a section, case posture, or statute..."
             autocomplete="off" spellcheck="false"
-            class="flex-1 bg-transparent outline-none text-sm text-parchment placeholder:text-silver/60 min-w-0 chat-input-box"></textarea>
+            class="flex-1 bg-transparent outline-none text-xs sm:text-sm text-parchment placeholder:text-silver/60 min-w-0 chat-input-box"></textarea>
         </div>
         <!-- #send-btn -> sendMessage(). -->
         <button id="send-btn" class="btn-primary flex-shrink-0 w-11 h-11 rounded-full flex items-center justify-center text-slate-950" aria-label="Send">
@@ -1008,7 +1023,7 @@ function normalizeDocTag(actName){
 marked.setOptions({ gfm: true, breaks: true });
 
 /* Called from EVERY place raw text becomes on-screen HTML: addUserBubble(),
-   addAssistantBubble(), retranslateAllBubbles(), playAudio(), and
+   addAssistantBubble(), the per-bubble translate handler, playAudio(), and
    openSheet() - see wiring map #8. This is the ONLY function in the file
    that runs untrusted text (LLM output, extracted PDF text) through
    innerHTML, and it always does so via marked -> DOMPurify first. */
@@ -1224,24 +1239,34 @@ function addUserVoiceBubble(audioBlob, transcribedText){
 /* Appends a left-aligned assistant bubble. `text` is what's actually
    RENDERED on screen (already translated, if applicable); `rawAnswer`
    (always English) is stashed untouched in the .listen-btn's
-   data-raw-answer attribute for playAudio()/retranslateAllBubbles() to
-   reuse later without needing to re-fetch it; `citations` becomes the
-   row of citation pills via citationPillHTML(). Called from both
-   sendMessage() and sendAudioMessage() once their /api/v1/chat response
-   arrives. */
-function addAssistantBubble(text, rawAnswer, citations){
+   data-raw-answer attribute for playAudio()/the per-bubble translate
+   handler to reuse later without needing to re-fetch it; `citations`
+   becomes the row of citation pills via citationPillHTML(). `displayLang`
+   is the language `text` was actually rendered in (falls back to the
+   currently-selected global language if omitted) and is stashed on
+   row.dataset.displayLang so a later language switch can tell (per
+   bubble) whether it's already correct or needs its Translate button
+   revealed - see markBubblesStale(). Called from both sendMessage() and
+   sendAudioMessage() once their /api/v1/chat response arrives. */
+function addAssistantBubble(text, rawAnswer, citations, displayLang){
   const row = document.createElement('div');
   row.className = 'chat-bubble-row flex justify-start';
 
   row.dataset.doc = (citations && citations[0]) ? normalizeDocTag(citations[0].doc) : 'general';
+
+  // Tracks which language THIS bubble is currently showing, so a later
+  // global language switch can tell (per bubble) whether it's already
+  // correct or needs the Translate button revealed. See wiring map #4a.
+  row.dataset.displayLang = displayLang || document.getElementById('lang-current').textContent.trim();
+  row.dataset.needsTranslation = 'false';
 
   const pillsHTML = (citations || []).map(citationPillHTML).join('');
 
   // CHANGED: the answer-text element is now a <div> (renderMarkdown
   // returns block-level content, e.g. <h3>, <table>, <ul>, which can't
   // legally sit inside a <p>) instead of the old <p class="answer-text">.
-  // playAudio() and retranslateAllBubbles() both look up '.answer-text'
-  // by class, so they keep working unchanged.
+  // playAudio() and the per-bubble translate handler both look up
+  // '.answer-text' by class, so they keep working unchanged.
   row.innerHTML = `
     <div class="flex gap-2.5 max-w-[90%] sm:max-w-[80%]">
       <div class="w-7 h-7 rounded-full bg-gradient-to-br from-brass-500 to-purple-500 flex-shrink-0 flex items-center justify-center mt-0.5">
@@ -1252,9 +1277,14 @@ function addAssistantBubble(text, rawAnswer, citations){
           <div class="answer-text text-sm text-parchment leading-relaxed">${renderMarkdown(text)}</div>
           <div class="flex flex-wrap mt-0.5">${pillsHTML}</div>
         </div>
-        <div class="flex items-center gap-2 mt-1.5">
+        <div class="flex items-center gap-3 mt-1.5">
           <button class="listen-btn flex items-center gap-1.5 text-[11px] text-silver hover:text-gold transition-colors" data-raw-answer="${encodeURIComponent(rawAnswer || text)}">
             <i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen
+          </button>
+          <!-- Hidden until this bubble is stale relative to the currently
+               selected language - see markBubblesStale(). -->
+          <button class="translate-btn hidden items-center gap-1.5 text-[11px] text-purple-accent hover:text-parchment transition-colors">
+            <i data-lucide="languages" class="w-3.5 h-3.5"></i> Translate this
           </button>
           <span class="listen-unavailable-note hidden text-[11px] text-silver/60"></span>
         </div>
@@ -1269,55 +1299,88 @@ function addAssistantBubble(text, rawAnswer, citations){
   listenBtn.addEventListener('click', () => playAudio(listenBtn, row));
 }
 
-/* Retranslation function pulled out to global scope to fix scope bug */
-/* Called from lockAndRetranslate() whenever the language dropdown
-   selection changes (see wiring map #4). Walks EVERY .listen-btn
-   currently in #chat-log (i.e. every assistant bubble ever added this
-   session), re-reads each one's stored raw English answer, resets its
-   Listen button/audio-cache state (since any previously-cached audio was
-   for the OLD language), and re-renders its on-screen text via
-   POST /api/v1/translate for the new `targetLang`. Does NOT touch
-   audio — no /api/v1/tts calls happen here; audio is only (re-)generated
-   later, on demand, if Listen is pressed again (playAudio() below). */
-async function retranslateAllBubbles(targetLang){
-  const listenButtons = document.querySelectorAll('.listen-btn');
+/* Called whenever the language dropdown selection changes (see wiring
+   map #4). Walks every assistant bubble currently in #chat-log and
+   compares its stored row.dataset.displayLang against `targetLang`:
+   bubbles already showing that language have their Translate button
+   hidden (nothing to do); every other bubble gets marked
+   needsTranslation='true', gets `targetLang` stashed on
+   row.dataset.pendingLang, and has its Translate button revealed. This
+   is instant and fires ZERO network calls - the actual translation only
+   happens later, per bubble, if/when the user clicks that bubble's
+   Translate button (see the delegated chatLog click listener below). */
+function markBubblesStale(targetLang){
+  document.querySelectorAll('.chat-bubble-row').forEach(row => {
+    const translateBtn = row.querySelector('.translate-btn');
+    if (!translateBtn) return; // user bubbles have no translate button
 
-  for (const btn of listenButtons) {
-    const rawAnswer = decodeURIComponent(btn.getAttribute('data-raw-answer') || '');
-    if (!rawAnswer) continue;
-
-    const row = btn.closest('.chat-bubble-row');
-    const textEl = row ? row.querySelector('.answer-text') : null;
-
-    if (btn._audioEl) {
-      btn._audioEl.pause();
-      btn._audioEl = null;
+    if (row.dataset.displayLang === targetLang) {
+      // Already correct for the new language - nothing to do.
+      translateBtn.classList.add('hidden');
+      translateBtn.classList.remove('flex');
+      row.dataset.needsTranslation = 'false';
+      return;
     }
-    btn._audioLang = null;
-    btn.dataset.playing = 'false';
-    btn.innerHTML = '<i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen';
 
-    const note = row ? row.querySelector('.listen-unavailable-note') : null;
-    if (note) note.classList.add('hidden');
-
-    try {
-      const response = await fetch('/api/v1/translate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: rawAnswer, lang: targetLang })
-      });
-      const data = await response.json();
-      // CHANGED: renderMarkdown instead of formatAnswerText
-      if (textEl && data.display_text) {
-        textEl.innerHTML = renderMarkdown(data.display_text);
-      }
-    } catch (err) {
-      console.error('Retranslation failed for a bubble:', err);
-    }
-  }
-
+    row.dataset.needsTranslation = 'true';
+    row.dataset.pendingLang = targetLang;
+    translateBtn.classList.remove('hidden');
+    translateBtn.classList.add('flex');
+    translateBtn.innerHTML = '<i data-lucide="languages" class="w-3.5 h-3.5"></i> Translate this';
+  });
   lucide.createIcons();
 }
+
+/* Single delegated listener for every .translate-btn currently in - or
+   later added to - #chat-log (per-bubble, on demand; see wiring map
+   #4a). Looks up the bubble's stored raw English answer, POSTs it to
+   /api/v1/translate for row.dataset.pendingLang, swaps in the translated
+   text, updates row.dataset.displayLang, hides the button again, and
+   resets that bubble's Listen/audio-cache state (any previously cached
+   audio was for the OLD language). */
+chatLog.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.translate-btn');
+  if (!btn) return;
+
+  const row = btn.closest('.chat-bubble-row');
+  if (!row || row.dataset.needsTranslation !== 'true') return;
+
+  const lang = row.dataset.pendingLang;
+  const listenBtn = row.querySelector('.listen-btn');
+  const rawAnswer = decodeURIComponent(listenBtn.getAttribute('data-raw-answer') || '');
+  const textEl = row.querySelector('.answer-text');
+
+  btn.disabled = true;
+  btn.innerHTML = '<i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin"></i> Translating...';
+  lucide.createIcons();
+
+  try {
+    const res = await fetch('/api/v1/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: rawAnswer, lang })
+    });
+    const data = await res.json();
+
+    if (textEl && data.display_text) textEl.innerHTML = renderMarkdown(data.display_text);
+    row.dataset.displayLang = lang;
+    row.dataset.needsTranslation = 'false';
+    btn.classList.add('hidden');
+    btn.classList.remove('flex');
+
+    // Old cached audio was for the previous language - reset Listen.
+    if (listenBtn._audioEl) { listenBtn._audioEl.pause(); listenBtn._audioEl = null; }
+    listenBtn._audioLang = null;
+    listenBtn.dataset.playing = 'false';
+    listenBtn.innerHTML = '<i data-lucide="volume-2" class="w-3.5 h-3.5"></i> Listen';
+  } catch (err) {
+    console.error('Per-bubble translation failed:', err);
+    btn.innerHTML = '<i data-lucide="languages" class="w-3.5 h-3.5"></i> Retry translate';
+  } finally {
+    btn.disabled = false;
+    lucide.createIcons();
+  }
+});
 
 /* Handler for a single bubble's .listen-btn - see wiring map #5 for the
    two-parallel-requests summary. `row` is that bubble's whole
@@ -1386,6 +1449,12 @@ async function playAudio(btn, row){
     if (textEl && translateData.display_text) {
       textEl.innerHTML = renderMarkdown(translateData.display_text);
     }
+    // This bubble is now showing currentLang - keep displayLang in sync
+    // so a later language switch doesn't needlessly flag it as stale.
+    row.dataset.displayLang = currentLang;
+    row.dataset.needsTranslation = 'false';
+    const translateBtn = row.querySelector('.translate-btn');
+    if (translateBtn) { translateBtn.classList.add('hidden'); translateBtn.classList.remove('flex'); }
 
     const ttsData = await ttsResp.json();
 
@@ -1508,8 +1577,9 @@ try {
    target_lang, doc_filter) to /api/v1/chat (main.py's chat_endpoint,
    which internally calls services/rag.py's query_lex_oracle()). On
    success, updates `sessionId` from the response and renders the
-   assistant bubble; on failure, renders a fixed error bubble instead
-   (with no raw answer/citations, since none exist). */
+   assistant bubble (tagged with the language it was just rendered in,
+   so it starts out NOT stale); on failure, renders a fixed error bubble
+   instead (with no raw answer/citations, since none exist). */
 async function sendMessage(){
   const input = document.getElementById('chat-input');
   const value = input.value.trim();
@@ -1544,7 +1614,7 @@ async function sendMessage(){
 
     sessionId = data.session_id;
     removeTyping();
-    addAssistantBubble(data.response_text, data.raw_answer, data.citations);
+    addAssistantBubble(data.response_text, data.raw_answer, data.citations, targetLang);
 
   } catch (error) {
     console.error("Backend API Error:", error);
@@ -1656,7 +1726,7 @@ async function sendAudioMessage(audioBlob){
     sessionId = data.session_id;
     removeTyping();
     addUserVoiceBubble(audioBlob, data.user_message);
-    addAssistantBubble(data.response_text, data.raw_answer, data.citations);
+    addAssistantBubble(data.response_text, data.raw_answer, data.citations, targetLang);
   } catch (error) {
     console.error("Backend API Error:", error);
     removeTyping();
@@ -1667,59 +1737,15 @@ async function sendAudioMessage(audioBlob){
 /* ---------------- Language Dropdown ---------------- */
 /* See wiring map #4. #lang-btn opens/closes #lang-dropdown; each
    .lang-option sets #lang-current's text (the actual value sent to the
-   backend on every request) and triggers a full retranslation batch of
-   every existing bubble via lockAndRetranslate(). */
+   backend on every request) and calls markBubblesStale(), which just
+   marks out-of-sync bubbles and reveals their per-bubble Translate
+   button - no batch retranslation, no lock, no network calls fire from
+   this handler at all. */
 const langBtn = document.getElementById('lang-btn');
 const langDropdown = document.getElementById('lang-dropdown');
-const langLockIndicator = document.getElementById('lang-lock-indicator');
-
-// Guards against overlapping translation batches: without this, clicking
-// through Yoruba -> Hausa -> Igbo quickly fires three overlapping
-// retranslateAllBubbles() runs. Two real problems follow from that, not
-// just one - wasted Google/MyMemory calls for a language the user has
-// already moved on from, AND a race condition where slower responses
-// from an earlier-picked language can land AFTER a later pick's
-// responses, leaving some bubbles showing the wrong language. Locking
-// the dropdown for the duration of one retranslation batch prevents
-// both. A hard timeout is included so a stalled network request can
-// never leave the UI locked indefinitely.
-let isTranslating = false;
-const TRANSLATE_LOCK_TIMEOUT_MS = 45000;
-
-/* Toggles the "locked" UI state: disables #lang-btn and every
-   .lang-option (via their `disabled` attribute + the CSS
-   disabled:opacity-50 rules defined above), and shows/hides
-   #lang-lock-indicator. Called by lockAndRetranslate() before and after
-   its retranslateAllBubbles() call. */
-function setLangControlsLocked(locked){
-  isTranslating = locked;
-  langBtn.disabled = locked;
-  langLockIndicator.classList.toggle('hidden', !locked);
-  langLockIndicator.classList.toggle('flex', locked);
-  document.querySelectorAll('.lang-option').forEach(o => { o.disabled = locked; });
-}
-
-/* Wraps retranslateAllBubbles(targetLang) with the lock described above,
-   plus a hard TRANSLATE_LOCK_TIMEOUT_MS ceiling (via Promise.race) so a
-   stalled /api/v1/translate request can never leave the dropdown
-   disabled forever - the `finally` always unlocks the controls even if
-   the timeout, rather than the real translation batch, is what won the
-   race. */
-async function lockAndRetranslate(targetLang){
-  setLangControlsLocked(true);
-  try {
-    await Promise.race([
-      retranslateAllBubbles(targetLang),
-      new Promise(resolve => setTimeout(resolve, TRANSLATE_LOCK_TIMEOUT_MS))
-    ]);
-  } finally {
-    setLangControlsLocked(false);
-  }
-}
 
 langBtn.addEventListener('click', (e)=>{
   e.stopPropagation();
-  if (isTranslating) return; // dropdown itself opens/closes normally, but stays inert mid-translation
   const isHidden = langDropdown.classList.contains('hidden');
   if(isHidden){
     langDropdown.classList.remove('hidden');
@@ -1739,7 +1765,6 @@ document.addEventListener('click', ()=> {
 document.querySelectorAll('.lang-option').forEach(opt=>{
   opt.addEventListener('click', (e)=>{
     e.stopPropagation();
-    if (isTranslating) return; // ignore a second pick while one is still in flight
     document.getElementById('lang-current').textContent = opt.dataset.lang;
     document.querySelectorAll('.lang-option').forEach(o=>{
       o.innerHTML = o.dataset.lang;
@@ -1751,7 +1776,8 @@ document.querySelectorAll('.lang-option').forEach(opt=>{
     opt.classList.add('text-parchment', 'flex', 'items-center', 'justify-between');
     lucide.createIcons();
     closeLangDropdown();
-    lockAndRetranslate(opt.dataset.lang);
+
+    markBubblesStale(opt.dataset.lang);   // instant, no network call
   });
 });
 

@@ -5,6 +5,9 @@ DOMINION LexOracle: Translation Service
 WHAT THIS FILE DOES:
 Translates the AI's English answer into whichever language the user picked
 (Yoruba, Hausa, Igbo, French, etc.). Public entry point: translate_text().
+For translating several independent texts as one coordinated batch (e.g.
+every bubble that needs updating on a single language-switch event), see
+translate_many() at the bottom of this file.
 
 TWO PRIOR VERSIONS, AND WHY NEITHER WAS RIGHT ALONE:
   - FAST: one Google Translate call on the whole raw Markdown answer. Quick,
@@ -43,6 +46,21 @@ cost is roughly the slowest single call rather than the sum of all of
 them. See the comment above `_mymemory_lock` for how the MyMemory
 per-second rate limit is still respected under this concurrency.
 
+BATCHING ACROSS BUBBLES (added): even with the per-answer concurrency
+above, a language switch on a multi-bubble conversation used to call
+translate_text() once per bubble, back to back - each call potentially
+spinning up its OWN thread pool and firing its OWN burst of requests on
+top of whatever the previous bubble's call was still doing. MyMemory's
+5-requests/second cap is a flat per-second ceiling that registering
+MYMEMORY_EMAIL does NOT raise (email only raises the daily word quota),
+so several bubbles' worth of concurrent slow-path bursts landing in the
+same second is what was actually triggering "too many requests" errors -
+not a lack of email registration. translate_many() is the fix: it takes
+a LIST of texts for one language-switch event, checks the cache for all
+of them up front, and dispatches only the uncached ones across ONE shared
+thread pool - so N bubbles never multiply into N independent bursts, they
+share the one real budget the throttle enforces.
+
 Everything else - bold-stripping, typographic normalization, MyMemory's
 garbage-result detection, the whole-answer-reverts-to-English-on-any-piece-
 failure guarantee, and the translation cache - is unchanged from before.
@@ -66,6 +84,14 @@ logger = logging.getLogger(__name__)
 # set MYMEMORY_EMAIL in .env. If it's unset, every MyMemoryTranslator
 # call below simply omits the email argument and falls back to the
 # stricter anonymous tier, so this is safe to leave unset too.
+#
+# IMPORTANT: this raises the DAILY word quota only. It does NOT raise
+# MyMemory's separate 5-requests/second cap (see _throttle_mymemory
+# below) - that per-second limit applies identically whether or not an
+# email is registered, which is why "too many requests" errors can still
+# happen even with MYMEMORY_EMAIL set. The real fix for THAT is reducing
+# how many concurrent requests get fired in the same second - see
+# translate_many() at the bottom of this file.
 MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 
 # MyMemory's free tier rejects requests longer than roughly 500 characters.
@@ -80,7 +106,9 @@ MYMEMORY_CHUNK_LIMIT = 450
 # (a handful of simultaneous requests) gets most of the latency win
 # without looking like a burst that risks a temporary block. MyMemory
 # calls made from inside this pool are still paced to its real per-second
-# cap by `_mymemory_lock` below, independent of this worker count.
+# cap by `_mymemory_lock` below, independent of this worker count. Also
+# reused by translate_many() below as the shared pool size across an
+# entire batch of bubbles, rather than per-bubble.
 _SLOW_PATH_MAX_WORKERS = 6
 
 # Caches a completed translation by the exact (english_text, target_lang)
@@ -106,19 +134,21 @@ def _cache_key(text: str, target_lang: str) -> tuple:
     return (text, target_lang)
 
 # MyMemory's free tier separately caps requests at roughly 5 per second
-# (distinct from its much larger daily word quota). Translating a
-# structured answer header-by-header and table-cell-by-cell, when the
-# slower fallback path is used, can easily fire off many MyMemory
-# requests for a single answer in quick succession - comfortably over
-# that per-second cap if nothing paces them. _throttle_mymemory is called
-# immediately before every MyMemory request and sleeps just long enough
-# to keep consecutive calls at least this far apart.
+# (distinct from its much larger daily word quota, and NOT raised by
+# registering MYMEMORY_EMAIL - see the comment above that variable).
+# Translating a structured answer header-by-header and table-cell-by-cell,
+# when the slower fallback path is used, can easily fire off many
+# MyMemory requests for a single answer in quick succession - comfortably
+# over that per-second cap if nothing paces them. _throttle_mymemory is
+# called immediately before every MyMemory request and sleeps just long
+# enough to keep consecutive calls at least this far apart.
 #
-# _mymemory_lock makes this safe now that multiple slow-path lines can
-# reach _translate_one_piece_mymemory from different threads at once
-# (see _SLOW_PATH_MAX_WORKERS above): without the lock, two threads could
-# both read the same stale _last_mymemory_call_at, both compute a "wait"
-# based on it, and both fire immediately after their own sleep - letting
+# _mymemory_lock makes this safe now that multiple slow-path lines - and,
+# via translate_many() below, multiple whole BUBBLES - can reach
+# _translate_one_piece_mymemory from different threads at once (see
+# _SLOW_PATH_MAX_WORKERS above): without the lock, two threads could both
+# read the same stale _last_mymemory_call_at, both compute a "wait" based
+# on it, and both fire immediately after their own sleep - letting
 # concurrency quietly defeat the pacing this function exists to enforce.
 # The lock only serializes the MyMemory dispatch moment itself (read
 # last-call-time, sleep if needed, update last-call-time); it does not
@@ -499,7 +529,10 @@ def _translate_line_preserving_structure(line: str, lang_code: str) -> str:
 
 def translate_text(text: str, target_lang: str = "English") -> str:
     """
-    Translates text into the requested language.
+    Translates a SINGLE piece of text into the requested language. For
+    translating several bubbles at once as part of one language-switch
+    event, use translate_many() instead - see its docstring at the bottom
+    of this file for why that matters for MyMemory's rate limit.
 
     English is returned completely untouched (bold and all). For every
     other language, see _translate_text_uncached for the fast-path-first,
@@ -618,3 +651,69 @@ def _translate_text_uncached(text: str, lang_code: str) -> str:
         executor.shutdown(wait=True)
 
     return "\n".join(translated_lines)
+
+
+def translate_many(texts: list, target_lang: str = "English") -> list:
+    """
+    Translates multiple independent texts (e.g. every bubble that needs
+    translating for one language-switch event) as ONE coordinated batch,
+    sharing a single cache pass and a single thread pool across all of
+    them - instead of each text calling translate_text() separately and
+    each one spinning up its own _SLOW_PATH_MAX_WORKERS-sized pool.
+
+    Why this exists: MyMemory's 5-requests/second cap is a flat per-second
+    ceiling that MYMEMORY_EMAIL does NOT raise (email only raises the
+    daily word quota - see the comment above that variable). The actual
+    fix for "too many requests" errors is never sending more concurrent
+    pieces than the shared throttle can absorb in the first place, not
+    registering an email. This function is the coordination point: every
+    text's slow-path work (if any) goes through the SAME pool and the
+    SAME module-level _mymemory_lock/_throttle_mymemory, so the real cap
+    is respected across the whole batch, not just within one answer.
+
+    Flow:
+    - English requested -> return texts unchanged, no work at all.
+    - For each text, check the cache first; only texts that miss go on
+      to real translation work.
+    - If every text was cached, return immediately - zero network calls.
+    - Otherwise, dispatch translation for every uncached text across one
+      shared ThreadPoolExecutor sized to _SLOW_PATH_MAX_WORKERS (not
+      per-text), so N texts don't multiply into N separate pools each
+      trying to claim that many workers simultaneously.
+    - Each completed translation is written into both the cache and the
+      results list before returning, in the same order as the input
+      `texts` list (not completion order), so callers can zip results
+      back onto whatever they used to build the request.
+    """
+    lang_code = lang_map.get(target_lang, "en")
+
+    if lang_code == "en":
+        return list(texts)
+
+    results = [None] * len(texts)
+    uncached_indices = []
+
+    for i, text in enumerate(texts):
+        cache_key = _cache_key(text, target_lang)
+        if cache_key in _translation_cache:
+            results[i] = _translation_cache[cache_key]
+        else:
+            uncached_indices.append(i)
+
+    if not uncached_indices:
+        return results
+
+    def _do_one(i):
+        text = texts[i]
+        translated = _translate_text_uncached(text, lang_code)
+        _translation_cache[_cache_key(text, target_lang)] = translated
+        return i, translated
+
+    worker_count = min(_SLOW_PATH_MAX_WORKERS, len(uncached_indices))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(_do_one, i) for i in uncached_indices]
+        for future in futures:
+            i, translated = future.result()
+            results[i] = translated
+
+    return results
