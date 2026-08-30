@@ -1328,11 +1328,11 @@ function addAssistantBubble(text, rawAnswer, citations, displayLang){
   // playAudio() and the per-bubble translate handler both look up
   // '.answer-text' by class, so they keep working unchanged.
   row.innerHTML = `
-    <div class="flex gap-2.5 max-w-[90%] sm:max-w-[80%]">
+  <div class="flex gap-2.5 max-w-[90%] sm:max-w-[80%]">
       <div class="w-7 h-7 rounded-full bg-gradient-to-br from-brass-500 to-purple-500 flex-shrink-0 flex items-center justify-center mt-0.5">
         <i data-lucide="scale" class="w-3.5 h-3.5 text-slate-950"></i>
       </div>
-      <div>
+      <div class="min-w-0 flex-1">
         <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-2.5">
           <div class="answer-text text-sm text-parchment leading-relaxed">${renderMarkdown(text)}</div>
           <div class="flex gap-1.5 mt-0.5 overflow-x-auto scrollbar-thin pb-1">${pillsHTML}</div>
