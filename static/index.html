@@ -139,12 +139,12 @@
     }
   }
 </script>
-<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<script src="/static/vendor/lucide-0.460.0.js"></script>
 <!-- ADDED: Markdown renderer + sanitizer, so the LLM's real Markdown
      (headers, tables, bold, bullets, horizontal rules) can be rendered
      as actual styled HTML instead of shown as literal characters. -->
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<script src="/static/vendor/marked-12.0.2.js"></script>
+<script src="/static/vendor/dompurify-3.1.6.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
@@ -269,6 +269,8 @@
      one calls openSheet(key), see wiring map #6. */
   .citation-pill{
     transition:background .18s ease, border-color .18s ease, transform .12s ease;
+    white-space:nowrap;
+    flex-shrink:0;
   }
   .citation-pill:hover{background:rgba(198,168,118,0.18);border-color:rgba(198,168,118,0.55);transform:translateY(-1px);}
   .citation-pill:focus-visible{outline:2px solid var(--gold);outline-offset:2px;}
@@ -366,16 +368,41 @@
     border-top:1px solid rgba(198,168,118,0.25);
     margin:0.9em 0;
   }
+  /* Wraps every rendered table in a horizontally-scrollable container with
+    a fading right-edge cue, so mobile users can tell a wide table is
+    swipeable instead of assuming it's cut off. See .table-scroll-wrap
+    below - marked's tables come out as plain <table> elements, so this
+    wrapper is added at render time in renderMarkdown(), not in raw HTML
+    here. */
+  .table-scroll-wrap{
+    position:relative;
+    overflow-x:auto;
+    -webkit-overflow-scrolling:touch;
+    margin-bottom:0.8em;
+  }
+  .table-scroll-wrap::after{
+    content:'';
+    position:absolute;
+    top:0; right:0; bottom:0;
+    width:24px;
+    background:linear-gradient(to right, transparent, rgba(15,23,42,0.85));
+    pointer-events:none;
+  }
+  .table-scroll-wrap.scrolled-end::after{
+    opacity:0; /* hide the fade once the user has scrolled to the end - nothing left to hint at */
+    transition:opacity .2s ease;
+  }
   .markdown-body table{
       border-collapse:collapse;
-      table-layout:fixed;
-      width:100%;
-      margin-bottom:0.8em;
+      table-layout:auto;
+      width:max-content;
+      max-width:none;
       font-size:0.85em;
+      margin-bottom:0;
   }
   .markdown-body td, .markdown-body th{
-      word-wrap:break-word;
-      overflow-wrap:break-word;
+      white-space:nowrap;
+      min-width:100px;
   }
   .markdown-body th, .markdown-body td{
     border:1px solid rgba(255,255,255,0.1);
@@ -1030,7 +1057,20 @@ marked.setOptions({ gfm: true, breaks: true });
 function renderMarkdown(text){
   const rawHtml = marked.parse(String(text));
   const clean = DOMPurify.sanitize(rawHtml);
-  return `<div class="markdown-body">${clean}</div>`;
+  // Wrap every <table> in a scroll container with a fade hint, so a
+  // wide statute table on mobile scrolls sideways instead of squeezing
+  // every column into unreadable widths - see .table-scroll-wrap in
+  // <style>. Done here (post-sanitize) rather than via CSS alone
+  // because the fade needs its own wrapping element, not just a rule
+  // on <table> itself.
+  const withWrappedTables = clean.replace(
+    /<table>/g,
+    '<div class="table-scroll-wrap"><table>'
+  ).replace(
+    /<\/table>/g,
+    '</table></div>'
+  );
+  return `<div class="markdown-body">${withWrappedTables}</div>`;
 }
 
 /* CHANGED: now also strips headers, table pipes/separator rows, and
@@ -1053,6 +1093,20 @@ function stripMarkdownForSpeech(text){
     .replace(/\n{2,}/g, '. ')                        // collapse blank lines into a pause
     .trim();
 }
+
+/* Hides each table's fade hint once the user has scrolled that specific
+   table to its right edge - nothing left to hint at past that point.
+   Listens on document with capture:true because .table-scroll-wrap
+   elements can appear anywhere inside dynamically-added assistant
+   bubbles, and native 'scroll' events don't bubble - capture phase is
+   what lets a single listener catch scrolling on any of them without
+   needing to attach a fresh listener to every wrapper individually. */
+document.addEventListener('scroll', (e) => {
+  const wrap = e.target.closest && e.target.closest('.table-scroll-wrap');
+  if (!wrap) return;
+  const atEnd = wrap.scrollLeft + wrap.clientWidth >= wrap.scrollWidth - 2;
+  wrap.classList.toggle('scrolled-end', atEnd);
+}, true);
 
 /* Loaded once, at page load - NOT a FastAPI route, this is a plain
    static JSON file served via the app.mount("/static", ...) StaticFiles
@@ -1275,7 +1329,7 @@ function addAssistantBubble(text, rawAnswer, citations, displayLang){
       <div>
         <div class="bubble-assistant rounded-2xl rounded-tl-sm px-4 py-2.5">
           <div class="answer-text text-sm text-parchment leading-relaxed">${renderMarkdown(text)}</div>
-          <div class="flex flex-wrap mt-0.5">${pillsHTML}</div>
+          <div class="flex gap-1.5 mt-0.5 overflow-x-auto scrollbar-thin pb-1">${pillsHTML}</div>
         </div>
         <div class="flex items-center gap-3 mt-1.5">
           <button class="listen-btn flex items-center gap-1.5 text-[11px] text-silver hover:text-gold transition-colors" data-raw-answer="${encodeURIComponent(rawAnswer || text)}">
