@@ -373,11 +373,22 @@
     margin:0.9em 0;
   }
   /* Wraps every rendered table in a horizontally-scrollable container with
-    a fading right-edge cue, so mobile users can tell a wide table is
-    swipeable instead of assuming it's cut off. See .table-scroll-wrap
-    below - marked's tables come out as plain <table> elements, so this
-    wrapper is added at render time in renderMarkdown(), not in raw HTML
-    here. */
+    fading edge shadows, so mobile users can tell a wide table is swipeable
+    instead of assuming it's cut off. See .table-scroll-wrap below - marked's
+    tables come out as plain <table> elements, so this wrapper is added at
+    render time in renderMarkdown(), not in raw HTML here.
+
+    The shadow is done with four stacked background-image gradients rather
+    than a pseudo-element, since position:sticky + float on ::after proved
+    unreliable across browsers for reasons that weren't worth chasing further.
+    The two "cover" gradients (background-attachment:local) scroll WITH the
+    table content and paint solid background right up to the table's true
+    left/right edges - so they cancel out to nothing once you've scrolled all
+    the way to that edge. The two "shadow" gradients (background-attachment:
+    scroll) stay pinned to the wrapper's visible edges and are what actually
+    render as the fade. Net effect: a shadow only shows on whichever side
+    still has more table to scroll to, with zero JS needed to track scroll
+    position. */
   .table-scroll-wrap{
       position:relative;
       overflow-x:auto;
@@ -385,23 +396,16 @@
       max-width:100%;
       width:100%;
       margin-bottom:0.8em;
-  }
-  .table-scroll-wrap::after{
-      content:'';
-      position:sticky;
-      float:right;
-      top:0;
-      right:0;
-      height:100%;
-      width:24px;
-      margin-left:-24px;
-      background:linear-gradient(to right, transparent, rgba(15,23,42,0.85));
-      pointer-events:none;
-      display:block;
-  }
-  .table-scroll-wrap.scrolled-end::after{
-      opacity:0;
-      transition:opacity .2s ease;
+      background-image:
+          linear-gradient(to right, rgba(15,23,42,0.95) 30%, rgba(15,23,42,0)),
+          linear-gradient(to left,  rgba(15,23,42,0.95) 30%, rgba(15,23,42,0)),
+          linear-gradient(to right, rgba(0,0,0,0.35), rgba(0,0,0,0)),
+          linear-gradient(to left,  rgba(0,0,0,0.35), rgba(0,0,0,0));
+      background-repeat:no-repeat;
+      background-color:rgba(15,23,42,0.9);
+      background-size:24px 100%, 24px 100%, 10px 100%, 10px 100%;
+      background-position:0 0, 100% 0, 0 0, 100% 0;
+      background-attachment:local, local, scroll, scroll;
   }
   .markdown-body table{
       border-collapse:collapse;
@@ -412,8 +416,10 @@
       margin-bottom:0;
   }
   .markdown-body td, .markdown-body th{
-      white-space:nowrap;
+      white-space:normal;
+      word-break:break-word;
       min-width:100px;
+      max-width:220px;
   }
   .markdown-body th, .markdown-body td{
     border:1px solid rgba(255,255,255,0.1);
@@ -1104,20 +1110,6 @@ function stripMarkdownForSpeech(text){
     .replace(/\n{2,}/g, '. ')                        // collapse blank lines into a pause
     .trim();
 }
-
-/* Hides each table's fade hint once the user has scrolled that specific
-   table to its right edge - nothing left to hint at past that point.
-   Listens on document with capture:true because .table-scroll-wrap
-   elements can appear anywhere inside dynamically-added assistant
-   bubbles, and native 'scroll' events don't bubble - capture phase is
-   what lets a single listener catch scrolling on any of them without
-   needing to attach a fresh listener to every wrapper individually. */
-document.addEventListener('scroll', (e) => {
-  const wrap = e.target.closest && e.target.closest('.table-scroll-wrap');
-  if (!wrap) return;
-  const atEnd = wrap.scrollLeft + wrap.clientWidth >= wrap.scrollWidth - 2;
-  wrap.classList.toggle('scrolled-end', atEnd);
-}, true);
 
 /* Loaded once, at page load - NOT a FastAPI route, this is a plain
    static JSON file served via the app.mount("/static", ...) StaticFiles
