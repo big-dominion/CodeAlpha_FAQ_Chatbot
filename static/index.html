@@ -25,11 +25,24 @@
   3. SENDING A MESSAGE (voice)
      #mic-btn starts/stops a MediaRecorder -> on stop, the recorded blob
      is previewed via #voice-preview-bar (play/cancel/send buttons) ->
-     #voice-preview-send -> sendAudioMessage() -> POST /api/v1/chat as
-     multipart form data with an `audio_file` field this time instead of
-     `text_input`. main.py's chat_endpoint runs it through
-     services/audio_handler.py's speech_to_text_from_bytes() before doing
-     anything else - the frontend never transcribes locally.
+     #voice-preview-send -> sendAudioMessage(), which runs in TWO steps
+     rather than one:
+       a) The user's voice bubble is shown IMMEDIATELY (via
+          addUserVoiceBubble(), with a "Transcribing..." placeholder),
+          then the blob is POSTed alone to /api/v1/transcribe - a
+          lightweight main.py route that calls
+          services/audio_handler.py's speech_to_text_from_bytes() and
+          returns just the transcript, with no Pinecone/Groq work at
+          all. The placeholder is replaced with the real transcript (or
+          an error) via updateVoiceBubbleTranscript().
+       b) Once the transcript is known, showTyping() runs and the
+          transcript is sent to POST /api/v1/chat as an ordinary TEXT
+          message (`text_input`, not `audio_file`) - reusing the exact
+          same path sendMessage() uses for typed questions.
+     This two-step split exists so the person sees their own voice note
+     and its transcript right away, instead of staring at nothing until
+     the full STT+RAG+Groq round trip finishes. The frontend never
+     transcribes locally either way - both steps still hit the backend.
 
   4. LANGUAGE SWITCHING
      #lang-btn opens #lang-dropdown; each .lang-option click sets
@@ -110,8 +123,8 @@
      asterisks aren't read aloud literally.
 
   Nothing in this file talks to Pinecone, Groq, or Google Translate
-  directly - every one of those integrations lives behind the three
-  FastAPI routes in main.py (/api/v1/chat, /api/v1/tts,
+  directly - every one of those integrations lives behind the FastAPI
+  routes in main.py (/api/v1/chat, /api/v1/transcribe, /api/v1/tts,
   /api/v1/translate), which is the complete list of backend endpoints
   this page ever calls. (/api/v1/translate/batch also still exists in the
   backend but is no longer called from this page - see wiring map #4a -
@@ -1770,7 +1783,7 @@ micBtn.addEventListener('click', async () => {
     micStatus.classList.remove('hidden');
     micStatus.textContent = 'Recording 0:00 - tap the mic again to stop';
     recordingInterval = setInterval(() => {
-      micStatus.textContent = `Recording ${formatElapsed(Date.now() - recordingStartTime)} — tap the mic again to stop`;
+      micStatus.textContent = `Recording ${formatElapsed(Date.now() - recordingStartTime)} - tap the mic again to stop`;
     }, 500);
   } catch (err) {
     console.error('Mic access denied or unavailable:', err);

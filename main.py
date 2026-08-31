@@ -36,17 +36,25 @@ internal logic itself:
   depend on conversation history and a naive cache-by-question-text
   would risk serving a contextually wrong cached answer.
 
-Three HTTP endpoints are exposed, each rate-limited independently (see the
+Four HTTP endpoints are exposed, each rate-limited independently (see the
 `@limiter.limit(...)` decorators) to keep the Groq/Pinecone usage this app
 pays for bounded even under abusive or accidental repeated requests:
 
-- `POST /api/v1/chat` - the main conversational endpoint. Accepts either
-  typed text or a recorded audio clip, maintains a per-session
-  conversation history in memory, calls `query_lex_oracle` to get a
-  grounded English answer, translates it if needed, and returns both the
-  translated and the original raw English answer (see the long comment
-  above the endpoint's return statement for why raw_answer is sent back
-  too).
+- `POST /api/v1/chat` - the main conversational endpoint. Accepts typed
+  text only (a recorded voice clip is transcribed via /api/v1/transcribe
+  FIRST, then its transcript is sent here as ordinary text - see that
+  endpoint below and index.html's sendAudioMessage() for why), maintains
+  a per-session conversation history in memory, calls `query_lex_oracle`
+  to get a grounded English answer, translates it if needed, and returns
+  both the translated and the original raw English answer (see the long
+  comment above the endpoint's return statement for why raw_answer is
+  sent back too).
+- `POST /api/v1/transcribe` - converts a recorded voice clip to text
+  ONLY, with no RAG/Groq work at all. Exists so the frontend can show the
+  person's own voice note and its transcript immediately after they hit
+  send, rather than waiting for the full chat_endpoint round trip to
+  finish before showing anything. Called first by sendAudioMessage() in
+  index.html; its result is then sent to /api/v1/chat as normal text.
 - `POST /api/v1/tts` - generates speech audio (and updated display text)
   for a given piece of text in a given language, called on demand only
   when the user actually presses "Listen" on an answer, using whatever
