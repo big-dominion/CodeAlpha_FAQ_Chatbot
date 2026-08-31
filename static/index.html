@@ -555,10 +555,7 @@
   <header class="glass-panel border-b border-white/5 sticky top-0 z-30">
     <div class="max-w-6xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between gap-3">
       <div class="flex items-center gap-3 min-w-0">
-        <!-- #back-to-welcome / #header-home-btn: both call goToWelcome(). -->
-        <button id="back-to-welcome" class="sm:hidden p-1.5 -ml-1.5 rounded-lg hover:bg-white/5 text-silver" aria-label="Back">
-          <i data-lucide="chevron-left" class="w-5 h-5"></i>
-        </button>
+        <!-- #header-home-btn calls goToWelcome(). -->
         <button id="header-home-btn" class="flex items-center gap-3 min-w-0 text-left rounded-lg hover:bg-white/5 -ml-1.5 pl-1.5 pr-2 py-1 transition-colors" aria-label="Return to welcome screen">
           <picture>
             <source srcset="/static/logo.avif" type="image/avif" />
@@ -1004,7 +1001,6 @@ function goToWelcome(){
 }
 
 document.getElementById('enter-workspace-btn').addEventListener('click', goToWorkspace);
-document.getElementById('back-to-welcome').addEventListener('click', goToWelcome);
 document.getElementById('header-home-btn').addEventListener('click', goToWelcome);
 
 /* ---------------- Filter Chips ---------------- */
@@ -1707,6 +1703,15 @@ let mediaRecorder = null;
 let audioChunks = [];
 let pendingAudioBlob = null;
 let previewAudioEl = null;
+let recordingInterval = null;
+let recordingStartTime = null;
+
+function formatElapsed(ms){
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2,'0')}`;
+}
 
 micBtn.addEventListener('click', async () => {
   if (mediaRecorder && mediaRecorder.state === 'recording') {
@@ -1722,6 +1727,9 @@ micBtn.addEventListener('click', async () => {
     mediaRecorder.onstop = () => {
       stream.getTracks().forEach(t => t.stop());
       micBtn.classList.remove('mic-recording');
+      micBtn.innerHTML = '<i data-lucide="mic" class="w-4.5 h-4.5"></i>';
+      lucide.createIcons();
+      clearInterval(recordingInterval);
       micStatus.classList.add('hidden');
       // Recorded as WebM/Opus - this exact blob type is what
       // services/audio_handler.py's convert_to_wav() expects to receive
@@ -1734,7 +1742,15 @@ micBtn.addEventListener('click', async () => {
 
     mediaRecorder.start();
     micBtn.classList.add('mic-recording');
+    micBtn.innerHTML = '<i data-lucide="square" class="w-4.5 h-4.5 text-red-400"></i>';
+    lucide.createIcons();
+
+    recordingStartTime = Date.now();
     micStatus.classList.remove('hidden');
+    micStatus.textContent = 'Recording 0:00 — tap the mic again to stop';
+    recordingInterval = setInterval(() => {
+      micStatus.textContent = `Recording ${formatElapsed(Date.now() - recordingStartTime)} — tap the mic again to stop`;
+    }, 500);
   } catch (err) {
     console.error('Mic access denied or unavailable:', err);
   }
@@ -1810,14 +1826,20 @@ async function sendAudioMessage(audioBlob){
 const langBtn = document.getElementById('lang-btn');
 const langDropdown = document.getElementById('lang-dropdown');
 
+function closeAllPopovers(){
+  if(!langDropdown.classList.contains('hidden')) closeLangDropdown();
+  if(!settingsDropdown.classList.contains('hidden')) closeSettingsDropdown();
+  const existingPop = document.getElementById('mobile-status-pop');
+  if(existingPop) existingPop.remove();
+}
+
 langBtn.addEventListener('click', (e)=>{
   e.stopPropagation();
   const isHidden = langDropdown.classList.contains('hidden');
+  closeAllPopovers();
   if(isHidden){
     langDropdown.classList.remove('hidden');
     requestAnimationFrame(()=>{ langDropdown.style.opacity='1'; langDropdown.style.transform='scale(1)'; });
-  } else {
-    closeLangDropdown();
   }
 });
 function closeLangDropdown(){
@@ -1860,12 +1882,11 @@ document.getElementById('motion-status').textContent =
 settingsBtn.addEventListener('click', (e)=>{
   e.stopPropagation();
   const isHidden = settingsDropdown.classList.contains('hidden');
+  closeAllPopovers();
   if(isHidden){
     settingsDropdown.classList.remove('hidden');
     settingsBtn.setAttribute('aria-expanded', 'true');
     requestAnimationFrame(()=>{ settingsDropdown.style.opacity='1'; settingsDropdown.style.transform='scale(1)'; });
-  } else {
-    closeSettingsDropdown();
   }
 });
 function closeSettingsDropdown(){
@@ -1898,8 +1919,9 @@ document.getElementById('return-home-btn').addEventListener('click', ()=>{
    call. */
 document.getElementById('status-btn').addEventListener('click', (e)=>{
   e.stopPropagation();
-  const existing = document.getElementById('mobile-status-pop');
-  if(existing){ existing.remove(); return; }
+  const wasOpen = !!document.getElementById('mobile-status-pop');
+  closeAllPopovers();
+  if(wasOpen) return;
   const pop = document.createElement('div');
   pop.id = 'mobile-status-pop';
   pop.className = 'glass-panel glow-border-purple rounded-xl p-3 fixed z-40 font-mono text-[11px] text-silver flex flex-col gap-1.5';
