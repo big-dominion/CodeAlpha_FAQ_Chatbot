@@ -419,7 +419,32 @@
       background-size:24px 100%, 24px 100%, 10px 100%, 10px 100%;
       background-position:0 0, 100% 0, 0 0, 100% 0;
       background-attachment:local, local, scroll, scroll;
+
+      /* Firefox: thin gold scrollbar matching the app's brass theme
+         (Firefox has no gradient-thumb support, so this renders as a
+         flat gold color rather than the gradient webkit gets below). */
+      scrollbar-width:thin;
+      scrollbar-color: var(--gold) transparent;
   }
+
+  /* Chrome/Safari/Edge: styled horizontal scrollbar for the table wrap,
+     matching the gold gradient used by .btn-primary and the citation
+     "Match" badges elsewhere in the app, instead of the default gray
+     OS scrollbar. */
+  .table-scroll-wrap::-webkit-scrollbar{
+      height:6px;
+  }
+  .table-scroll-wrap::-webkit-scrollbar-track{
+      background:transparent;
+  }
+  .table-scroll-wrap::-webkit-scrollbar-thumb{
+      background:linear-gradient(90deg, var(--gold-deep), var(--gold));
+      border-radius:9999px;
+  }
+  .table-scroll-wrap::-webkit-scrollbar-thumb:hover{
+      background:linear-gradient(90deg, var(--gold), var(--gold-deep));
+  }
+
   .markdown-body table{
       border-collapse:collapse;
       table-layout:auto;
