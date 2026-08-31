@@ -65,13 +65,17 @@ A few design choices in this project were made on purpose, and it helps to under
 
 **The same question is cached so it always returns the same answer.** The very first version of this app occasionally gave two different answers, or two different sets of citations, to the exact same question asked twice. This traced back to the AI's own request expansion step producing a slightly different search phrase each time, which then pulled a slightly different set of statute sections from the database. Caching the expansion by the exact question text fixes this: the same question always expands the same way, always searches the same way, and always answers the same way.
 
+**Repeated opening questions are served from a small cache, without waiting on the AI or the database.** Separately from the search-expansion cache described above, the very first question of a new conversation is checked against a bounded, 500-entry cache before anything else runs. During a burst of traffic, many different people tend to ask the same handful of common questions when they first land on the app - caching those means every repeat after the first one costs nothing: no AI call, no database search, no wait. This only applies to a conversation's first message, and only when searching all six laws at once, since a later message depends on that specific conversation's history and can't safely be shared across different users.
+
+**A single, short retry protects against a momentary AI service hiccup.** The final call to the AI model is retried once, after a brief pause, if it fails outright. This is capped at exactly one retry with a short fixed wait, rather than several attempts with a growing delay, because under real load a long retry chain just makes a person wait longer for what is likely to be the same eventual failure anyway.
+
 **Translations either fully succeed or fully fall back to English, never half and half.** If one piece of an answer fails to translate (for example, a strange character trips up the backup translation service), the entire answer reverts to English rather than showing five sentences in Yoruba and one still in English. A partially translated answer looks more broken and more confusing than a fully English one.
 
 **Two translation engines are used, with one as backup for the other.** Google Translate is tried first for every translation. If it fails, returns an error page, or is rate limited, the app automatically retries using MyMemory Translator instead, so a translation request rarely returns a hard error to the user.
 
 **Translation tries a fast path first, then falls back to a careful one.** A single whole-answer call to Google Translate is attempted first. The result is validated - line count, Markdown table pipe-count per row, and header prefix count must all match the original - before it's trusted. If that check fails, or Google itself errors out, translation falls back to a slower line-by-line and cell-by-cell method, with MyMemory as backup for any piece Google can't handle. Text is also normalized (curly quotes, em-dashes, §, ellipses) before being sent to either service.
 
-**The frontend has no build step.** The entire user interface, layout, styling, and behavior lives inside one static index.html file, using Tailwind CSS and small utility libraries loaded directly from a CDN. This removes the need for Node.js, npm, or any bundler on the machine running the app, which keeps the deployed service small and simple to run on a platform like Render.
+**The frontend has no build step.** The entire user interface, layout, styling, and behavior lives inside one static index.html file, using Tailwind CSS (from a CDN) and a small set of self-hosted utility libraries. This removes the need for Node.js, npm, or any bundler on the machine running the app, which keeps the deployed service small and simple to run on a platform like Render.
 
 **Ingestion happens once, separately from the running app.** The six statute PDFs are only ever read and processed by the ingestion script, which is run manually, not automatically. The live app never opens a PDF. It only searches the Pinecone database that ingestion already filled. This keeps the live app's startup fast and keeps a slow, occasional task (reading and chunking PDFs) completely separate from the fast, frequent task (answering a question).
 
@@ -90,6 +94,7 @@ A few design choices in this project were made on purpose, and it helps to under
 - gTTS: used to turn text into spoken audio
 - SpeechRecognition, pydub, and imageio-ffmpeg: used together to turn a recorded voice question into text
 - slowapi: used to limit how many requests one person can make per minute
+- tenacity: used to retry the final AI answer call once if it fails outright
 - python-dotenv: used to load settings from the .env file
 - uv: the tool used to manage the Python environment and dependencies
 
@@ -97,8 +102,7 @@ A few design choices in this project were made on purpose, and it helps to under
 
 - Plain HTML, CSS, and JavaScript, no framework and no build step
 - Tailwind CSS (loaded from a CDN link)
-- marked and DOMPurify, used to safely turn the AI's Markdown formatted answers into styled, safe HTML
-- Lucide Icons (loaded from a CDN link)
+- Lucide (icons), Marked (Markdown rendering), and DOMPurify (sanitization) - vendored locally under `static/vendor/`, pinned to specific versions, rather than loaded from a CDN
 
 ## Full Project Structure
 
@@ -110,7 +114,7 @@ This matches the exact order the project appears in VS Code's own Explorer panel
 CodeAlpha_FAQ_Chatbot/
 |
 |-- data/
-|   |-- docs/                  [Source PDFs, used by ingestion, not by the live app]
+|   |-- docs/                    [Source PDFs, used by ingestion, not by the live app]
 |       |-- acja_2015.pdf
 |       |-- cama_2020.pdf
 |       |-- constitution_1999.pdf
@@ -119,25 +123,24 @@ CodeAlpha_FAQ_Chatbot/
 |       |-- penal_code.pdf
 |
 |-- services/
-|   |-- __init__.py            [REQUIRED - empty file, tells Python this folder is a package]
-|   |-- audio_handler.py       [REQUIRED - handles voice input and audio output]
-|   |-- rag.py                 [REQUIRED - the core AI logic]
-|   |-- translator.py          [REQUIRED - handles all translation]
-|   |-- vector_store.py        [REQUIRED - talks to Pinecone]
+|   |-- __init__.py              [REQUIRED - empty file, tells Python this folder is a package]
+|   |-- audio_handler.py         [REQUIRED - handles voice input and audio output]
+|   |-- rag.py                   [REQUIRED - the core AI logic]
+|   |-- translator.py            [REQUIRED - handles all translation]
+|   |-- vector_store.py          [REQUIRED - talks to Pinecone]
 |
 |-- static/
-|   |-- index.html             [REQUIRED - the entire frontend]
-|   |-- logo.avif              [REQUIRED - the app logo shown in the UI (optimized format)]
-|   |-- logo.png               [REQUIRED - the app logo shown in the UI (fallback format)]
-|   |-- source-links.json      [REQUIRED - links each law to its full source document]
+|   |-- vendor/                  [Self-hosted JS libraries, pinned versions - not loaded from a CDN]
+|       |-- dompurify-3.1.6.js
+|       |-- lucide-0.460.0.js
+|       |-- marked-12.0.2.js
+|   |-- index.html
+|   |-- logo.avif
+|   |-- logo.png
+|   |-- source-links.json
 |
-|-- .env                        [My own secret keys, never committed to GitHub]
-|-- .env.example                [A template showing which keys are needed, safe to commit]
-|-- .gitignore                  [Tells Git which files and folders to ignore]
-|-- .python-version              [Pins the Python version to 3.12 for uv]
-|-- cloud_index.py             [SETUP - run once, creates the Pinecone index]
-|-- ingest.py                  [SETUP/MAINTENANCE - loads the PDFs into Pinecone]
-|-- main.py                    [REQUIRED - the app cannot run without this]
+|-- cache.py                     [Bounded in-memory response cache for repeated questions]
+|-- main.py
 |-- measure_data.py             [DEVELOPMENT ONLY - checks how well the section splitting regex is working]
 |-- pyproject.toml               [Lists the project's dependencies, used by uv]
 |-- README.md                    [This file]
@@ -163,6 +166,8 @@ A closer look at what each one actually does:
 - **static/index.html**: The entire user interface. This one file contains the layout, the styling, and all the JavaScript that talks to the backend. There is no separate frontend build step.
 - **static/logo.png / logo.avif**: The app's logo image, shown on the welcome screen and in the header.
 - **static/source-links.json**: A small file that maps each law's short name (like CAMA_2020) to a link where the person can read the full original document.
+- **static/vendor/**: Self-hosted copies of Lucide, Marked, and DOMPurify, pinned to specific versions, so the frontend doesn't depend on a third-party CDN being reachable at runtime.
+- **cache.py**: A small, bounded LRU cache that stores the answer to a session's opening question, so if many different users ask the same common question during a traffic spike, only the first one actually triggers a full search-and-generate cycle - everyone after that gets served from cache instantly. Capped at 500 entries with a 20 minute expiry, so memory use can never grow without bound no matter how much traffic arrives.
 
 ### Files used once, to set the project up
 
@@ -397,7 +402,8 @@ Successful response:
 
 ## Known Limitations
 
-- The app's short term memory (recent conversations, cached translations, cached search expansions) lives only in the server's own memory. It resets whenever the server restarts. This is expected and normal for a single server setup. Moving to something shared, such as Redis, would only be needed if this app ran across multiple worker processes at once.
+- Both the AI model and the translation services run on free tiers with real rate limits. Under unusually heavy simultaneous traffic, a person may occasionally see a message saying the AI service could not be reached, or see an answer come back in English when a translation was requested. Both are the app failing safely and honestly rather than showing a broken or partial result - requests are not retried indefinitely in a way that would make a temporary slowdown worse for everyone else using the app at the same time.
+- The app's short term memory (recent conversations, cached translations, cached search expansions, cached first-turn answers) lives only in the server's own memory. It resets whenever the server restarts. This is expected and normal for a single server setup. Moving to something shared, such as Redis, would only be needed if this app ran across multiple worker processes at once.
 - Both translation services used (Google Translate and MyMemory) are free, unofficial services accessed without a paid API key. They can occasionally be slow or temporarily unavailable, which is exactly why the app has a backup translator and a fallback to plain English if both struggle.
 - Voice recognition quality depends on the browser's recording quality and on Google's speech recognition service. Not every language transcribes with the same accuracy, which is why the transcript is always shown back to the person so a bad recording can be caught before it is answered.
 - AI generated answers are deterministic as far as client side settings allow (a fixed temperature and seed are used for every request), but the underlying inference service can still occasionally return slightly different wording. Caching the search expansion step (see Architecture Notes) protects the more important part, which is that the same question always retrieves the same statute sections.

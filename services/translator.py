@@ -64,6 +64,23 @@ share the one real budget the throttle enforces.
 Everything else - bold-stripping, typographic normalization, MyMemory's
 garbage-result detection, the whole-answer-reverts-to-English-on-any-piece-
 failure guarantee, and the translation cache - is unchanged from before.
+
+RATE-LIMIT HANDLING (fail-fast, no retry): _translate_one_piece_mymemory
+makes exactly one attempt and does NOT retry on a rate-limit response.
+Retrying was the original behavior, but under a real traffic spike, many
+pieces across many concurrent users hit the rate limit in the same
+window - a retry-after-sleep in that situation means every one of those
+pieces waits, THEN fires a second request into an API that is still
+rate-limited by everyone else's retries landing in the same window,
+which compounds the 429s instead of recovering from them. Failing
+immediately reverts just that one answer to English (via
+_PieceTranslationFailed, same as any other piece failure) rather than
+adding another wave of outbound requests on top of an already-saturated
+free tier. Trade-off: a one-off, non-load-related rate-limit blip on a
+quiet day no longer gets a second chance to recover - that answer falls
+back to English immediately instead of quietly succeeding on retry. This
+was a deliberate choice to prioritize not compounding load during a
+spike over resilience during normal traffic.
 """
 import logging
 import os
@@ -170,9 +187,10 @@ def _throttle_mymemory():
 
 
 # Substring MyMemory's own rate-limit error message contains, regardless
-# of exact wording changes on their end. Used to tell "you're going too
-# fast, try again shortly" apart from a genuine failure (bad language
-# code, network drop, etc.) so only the former gets a retry.
+# of exact wording changes on their end. No longer used to trigger a
+# retry (see the module docstring's "RATE-LIMIT HANDLING" section) - kept
+# only so the warning log can distinguish a rate-limit failure from any
+# other kind of failure when diagnosing issues after the fact.
 _RATE_LIMIT_SIGNATURE = "too many requests"
 
 lang_map = {
@@ -215,12 +233,11 @@ def _looks_like_google_error_page(text: str) -> bool:
 class _PieceTranslationFailed(Exception):
     """
     Raised when a single piece cannot be translated by either engine
-    (Google failed or returned an error page, and MyMemory failed after
-    its retry or returned a garbage result). Caught in
-    _translate_text_uncached so the WHOLE answer falls back to English
-    instead of mixing translated and untranslated pieces - a half-Hausa/
-    half-English table looks broken regardless of why the one cell
-    failed.
+    (Google failed or returned an error page, and MyMemory failed or
+    returned a garbage result). Caught in _translate_text_uncached so
+    the WHOLE answer falls back to English instead of mixing translated
+    and untranslated pieces - a half-Hausa/half-English table looks
+    broken regardless of why the one cell failed.
     """
     pass
 
@@ -408,12 +425,14 @@ def _translate_one_piece_mymemory(piece: str, lang_code: str) -> str:
     isolation. Only reached from _translate_run, and only when Google has
     already failed for that specific piece.
 
-    Makes up to two attempts: a rate-limit response (matched against
-    _RATE_LIMIT_SIGNATURE) gets one retry after a longer pause, since
-    that failure mode is almost always transient; anything else raises
-    _PieceTranslationFailed immediately rather than quietly returning
-    English for just this one piece - see the module docstring for why a
-    consistent single-language answer beats a partially-translated one.
+    Makes exactly one attempt - no retry, even on a rate-limit response.
+    See the module docstring's "RATE-LIMIT HANDLING" section for why:
+    under a real traffic spike, retrying a rate-limited piece just adds
+    a second wave of requests into an already-saturated free tier. Any
+    failure here - rate limit, network error, empty result, or a garbage
+    result - raises _PieceTranslationFailed immediately, which reverts
+    the whole answer to English rather than shipping a partially
+    translated or mixed-language result.
     """
     mymemory_code = MYMEMORY_LANG_MAP.get(lang_code, lang_code)
 
@@ -421,33 +440,40 @@ def _translate_one_piece_mymemory(piece: str, lang_code: str) -> str:
     if MYMEMORY_EMAIL:
         translator_kwargs["email"] = MYMEMORY_EMAIL
 
-    for attempt in (1, 2):
-        _throttle_mymemory()
-        try:
-            result = MyMemoryTranslator(**translator_kwargs).translate(piece)
+    _throttle_mymemory()
+    try:
+        result = MyMemoryTranslator(**translator_kwargs).translate(piece)
 
-            if not result:
-                raise _PieceTranslationFailed(piece)
+        if not result:
+            raise _PieceTranslationFailed(piece)
 
-            if _looks_like_garbage_result(piece, result):
-                logger.warning(
-                    f"MyMemory returned a garbage result for one piece, "
-                    f"failing the whole answer back to English. Piece: {piece[:60]!r}"
-                )
-                raise _PieceTranslationFailed(piece)
+        if _looks_like_garbage_result(piece, result):
+            logger.warning(
+                f"MyMemory returned a garbage result for one piece, "
+                f"failing the whole answer back to English. Piece: {piece[:60]!r}"
+            )
+            raise _PieceTranslationFailed(piece)
 
-            return result
-        except _PieceTranslationFailed:
-            raise
-        except Exception as e:
-            if attempt == 1 and _RATE_LIMIT_SIGNATURE in str(e).lower():
-                logger.warning(f"MyMemory rate-limited this piece, waiting then retrying once. Error: {e}")
-                time.sleep(1.5)
-                continue
+        return result
+    except _PieceTranslationFailed:
+        raise
+    except Exception as e:
+        # No retry-on-rate-limit anymore, even though that failure mode
+        # is usually transient in isolation. Under a real traffic spike,
+        # many pieces across many concurrent users hit this at once - a
+        # retry-after-sleep here means every one of those pieces waits,
+        # THEN fires a second request into an API that is still
+        # rate-limited by everyone else's retries landing in the same
+        # window. That compounds the 429s instead of recovering from
+        # them. Failing immediately reverts just this one answer to
+        # English (via _PieceTranslationFailed, same as any other
+        # failure) rather than adding another wave of outbound requests
+        # on top of an already-saturated free tier.
+        if _RATE_LIMIT_SIGNATURE in str(e).lower():
+            logger.warning(f"MyMemory rate-limited this piece, failing fast to English. Error: {e}")
+        else:
             logger.warning(f"MyMemory failed on one piece, failing the whole answer back to English. Error: {e}")
-            raise _PieceTranslationFailed(piece) from e
-
-    raise _PieceTranslationFailed(piece)
+        raise _PieceTranslationFailed(piece) from e
 
 
 def _translate_run(text: str, lang_code: str) -> str:

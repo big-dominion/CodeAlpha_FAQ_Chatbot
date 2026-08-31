@@ -21,6 +21,10 @@ chunks from the vector store. Those chunks are assembled into a
 character-budgeted context block, injected into a system prompt with strict
 formatting/citation rules, and sent to the LLM a second time to produce the
 final answer along with a parallel list of citation cards for the frontend.
+This second call is wrapped in a small, bounded retry (see
+`_generate_final_answer` below) - see its own docstring for why only this
+one call gets a retry and why it is capped at two attempts with a short
+fixed wait rather than a longer backoff chain.
 
 Why this file cares so much about determinism:
 Legal answers need to be consistent - the same question asked twice should
@@ -85,6 +89,7 @@ history)` is the single public entry point other modules should call.
 import os
 import logging
 from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from services.vector_store import search_laws
 
 logger = logging.getLogger(__name__)
@@ -170,7 +175,12 @@ def expand_query(user_query: str) -> str:
       model's internal reasoning pass doesn't crowd out the actual
       keyword output), "low" reasoning effort (since this is a simple
       keyword-extraction task, not one needing deep reasoning), and the
-      shared GROQ_SEED.
+      shared GROQ_SEED. This call is deliberately NOT wrapped in the
+      bounded retry used for the final-answer call below - see
+      `_generate_final_answer`'s docstring for why only that call gets
+      one. If this call fails outright, the except block below already
+      falls back to the original, un-expanded query, which is a cheap
+      and safe degradation that doesn't need a retry on top of it.
     - If the model returned real (non-empty) content, prepend the
       original user query to it, so the final search string always still
       contains the user's own wording alongside the expansion.
@@ -225,6 +235,54 @@ User Query: {user_query}"""
         return user_query
 
 
+# Bounded retry, deliberately isolated to its own tiny function rather
+# than wrapping the whole try/except block in query_lex_oracle below.
+# Only the actual network call to Groq is retried here - not the context
+# assembly, not the citation building, not the post-processing - so a
+# retry never redoes work that already succeeded.
+#
+# Capped at 2 attempts with a short fixed 2-second wait, not a longer
+# exponential backoff: under real load (the traffic-spike scenario this
+# was added for), a long backoff chain just makes the user wait longer
+# for what is very likely still going to be the same eventual failure,
+# and a second aggressive retry storm on an already-saturated free-tier
+# endpoint would make the underlying rate-limit problem worse for every
+# other concurrent user, not better. One quick second attempt catches a
+# transient blip; anything beyond that is treated as a real outage and
+# handled by the existing except block in query_lex_oracle, which falls
+# back to the fixed "System Error" message instead of propagating.
+@retry(stop=stop_after_attempt(2), wait=wait_fixed(2), retry=retry_if_exception_type(Exception))
+def _generate_final_answer(messages: list):
+    """Makes the final-answer Groq call, retried once on any exception (see comment above)."""
+    return groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        temperature=0.0,
+        max_tokens=MAX_ANSWER_TOKENS,
+        seed=GROQ_SEED,
+        # Cheap, deterministic backstop against the ABSOLUTE BOUNDARIES
+        # prompt block in query_lex_oracle getting bypassed: generation
+        # halts the instant the model starts emitting a code/SQL shape,
+        # regardless of what led it there. See the module docstring's
+        # "PROMPT-INJECTION / DRIFT DEFENSE" section for how this fits
+        # with the other three layers (the prompt block, and the
+        # input-triage/output-regex layers in main.py).
+        #
+        # Capped at 4 entries because Groq's API rejects a `stop` list
+        # longer than 4 with a 400 error (confirmed in production: an
+        # earlier 8-item list silently sent every single chat request
+        # into the except block below for the whole time it was live,
+        # since the exception was caught and replaced with the fixed
+        # "System Error" message rather than propagating loudly).
+        # Screenplay markers ("INT. ", "FADE IN", "FADE OUT") were cut
+        # from this list to make room, not from the defense overall -
+        # main.py's contains_drift regex backstop still catches them,
+        # just one step later (after generation completes, via
+        # substitution, instead of an early halt mid-generation).
+        stop=["```", "\ndef ", "CREATE TABLE", "SELECT * FROM"]
+    )
+
+
 def query_lex_oracle(query: str, doc_filter: str, history: list):
     """Orchestrates query expansion, vector retrieval, token budgeting, and LLM generation.
 
@@ -270,18 +328,18 @@ def query_lex_oracle(query: str, doc_filter: str, history: list):
     - Step 5: Assemble the message list: the system prompt first, then up
       to the last 4 messages of conversation `history` (for short-term
       context), then the current raw `query` as the newest user message.
-    - Step 6: Call Groq for the final answer with temperature=0,
-      `MAX_ANSWER_TOKENS` as the output ceiling, the shared `GROQ_SEED`,
-      and a set of `stop` sequences that halt generation the instant the
-      model starts emitting a code/SQL/screenplay shape - see the module
-      docstring for why this exists alongside the ABSOLUTE BOUNDARIES
-      prompt block rather than instead of it. Print the response's
-      `system_fingerprint` purely as a diagnostic (see its own comment
-      below for how to use it). If a real answer came back, normalize
-      em-dashes and en-dashes to a plain " - " for consistent rendering.
-    - Step 7: If the Groq call itself raises, log the full exception and
-      fall back to a fixed "System Error" message instead of letting the
-      exception propagate up to the caller.
+    - Step 6: Call `_generate_final_answer(messages)` - which internally
+      retries once (see that function's docstring) - to get the final
+      answer, with temperature=0, `MAX_ANSWER_TOKENS` as the output
+      ceiling, the shared `GROQ_SEED`, and the code/SQL `stop` sequences.
+      Print the response's `system_fingerprint` purely as a diagnostic
+      (see its own comment below for how to use it). If a real answer
+      came back, normalize em-dashes and en-dashes to a plain " - " for
+      consistent rendering.
+    - Step 7: If `_generate_final_answer` still raises after its internal
+      retry, log the full exception and fall back to a fixed "System
+      Error" message instead of letting the exception propagate up to
+      the caller.
     - Return a dict with the raw answer text and the full citations list,
       for the calling code (e.g. the Flask/FastAPI route) to render.
     """
@@ -378,33 +436,7 @@ Regardless of the language used in the user's prompt (whether Yoruba, Hausa, Igb
     messages.append({"role": "user", "content": query})
 
     try:
-        response = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            temperature=0.0,
-            max_tokens=MAX_ANSWER_TOKENS,
-            seed=GROQ_SEED,
-            # Cheap, deterministic backstop against the ABSOLUTE BOUNDARIES
-            # prompt block above getting bypassed: generation halts the
-            # instant the model starts emitting a code/SQL shape,
-            # regardless of what led it there. See the module docstring's
-            # "PROMPT-INJECTION / DRIFT DEFENSE" section for how this fits
-            # with the other three layers (the prompt block above, and the
-            # input-triage/output-regex layers in main.py).
-            #
-            # Capped at 4 entries because Groq's API rejects a `stop` list
-            # longer than 4 with a 400 error (confirmed in production: an
-            # earlier 8-item list silently sent every single chat request
-            # into the except block below for the whole time it was live,
-            # since the exception was caught and replaced with the fixed
-            # "System Error" message rather than propagating loudly).
-            # Screenplay markers ("INT. ", "FADE IN", "FADE OUT") were cut
-            # from this list to make room, not from the defense overall -
-            # main.py's contains_drift regex backstop still catches them,
-            # just one step later (after generation completes, via
-            # substitution, instead of an early halt mid-generation).
-            stop=["```", "\ndef ", "CREATE TABLE", "SELECT * FROM"]
-        )
+        response = _generate_final_answer(messages)
         raw_answer = response.choices[0].message.content
 
         # Diagnostic only, not used for any logic: if the exact same

@@ -27,6 +27,14 @@ internal logic itself:
 - `services/audio_handler.py` (speech_to_text_from_bytes,
   text_to_speech_base64) converts between recorded voice audio and text
   in both directions.
+- `cache.py` (get_cached_response, set_cached_response) is a bounded
+  LRU cache for the first turn of a chat session, so repeated common
+  questions (e.g. "who can become president of Nigeria") from different
+  users during a traffic spike don't each independently pay for a fresh
+  Pinecone + Groq round trip. Deliberately restricted to the FIRST
+  message of a session (see chat_endpoint below) since later turns
+  depend on conversation history and a naive cache-by-question-text
+  would risk serving a contextually wrong cached answer.
 
 Three HTTP endpoints are exposed, each rate-limited independently (see the
 `@limiter.limit(...)` decorators) to keep the Groq/Pinecone usage this app
@@ -78,7 +86,8 @@ call itself. This file adds:
     how the model was tricked, only what actually came out, and it
     substitutes a fixed refusal sentence if the answer looks like code,
     SQL, a screenplay, or a prompt-leak attempt slipped through both of
-    the earlier layers in rag.py.
+    the earlier layers in rag.py. This check also gates the cache (see
+    chat_endpoint): an answer that trips this check is never cached.
 """
 
 import os
@@ -110,6 +119,7 @@ from slowapi.errors import RateLimitExceeded
 from services.audio_handler import text_to_speech_base64, speech_to_text_from_bytes
 from services.translator import translate_text, translate_many
 from services.rag import query_lex_oracle
+from cache import get_cached_response, set_cached_response
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
@@ -354,9 +364,21 @@ async def chat_endpoint(
     - Append the user's message to this session's history as a
       {"role": "user", ...} entry - this mutates the same list object
       touch_session returned, which lives inside chat_sessions.
-    - Call `query_lex_oracle(user_message, doc_filter, history)` to run
-      the full RAG pipeline and get back the raw English answer plus its
-      citations.
+    - Decide whether this turn is cache-eligible: only the FIRST message
+      of a session (`len(history) == 1` right after the append above)
+      with the default `doc_filter == "all"`. Later turns depend on
+      conversation history that a plain question-text cache key can't
+      capture, so caching them risks serving a contextually wrong
+      cached answer to a different conversation - restricting to the
+      first turn keeps the cache safe while still catching the common
+      case a launch spike actually produces (many different users
+      independently asking the same opening civics question).
+    - If cache-eligible and a cached entry exists, skip `query_lex_oracle`
+      entirely and reuse the cached raw_answer/citations. Otherwise call
+      `query_lex_oracle(user_message, doc_filter, history)` as before,
+      and if the turn was cache-eligible AND the answer is non-empty AND
+      it doesn't trip `contains_drift`, store it via
+      `set_cached_response` for the next matching first-turn question.
     - If the raw answer came back empty/blank (can genuinely happen after
       a very short or unclear voice recording, or an LLM hiccup),
       substitute a friendly fallback message asking the user to rephrase,
@@ -404,18 +426,31 @@ async def chat_endpoint(
 
     history.append({"role": "user", "content": user_message})
 
-    response_data = query_lex_oracle(user_message, doc_filter, history)
-    raw_answer = response_data.get("raw_answer", "Error generating response.")
+    # Only the first turn of a fresh session, with the default doc
+    # filter, is safe to serve from cache - see the docstring above for
+    # why later turns are excluded.
+    cache_eligible = len(history) == 1 and doc_filter == "all"
 
-    # Guards against a blank AI answer (this can happen after a very
-    # short or unclear voice recording) reaching the person as an empty
-    # message instead of a real sentence.
-    if not raw_answer or not raw_answer.strip():
-        raw_answer = "I wasn't able to generate a response to that. Could you rephrase your question?"
-    elif contains_drift(raw_answer):
-        raw_answer = "I can only provide statutory legal information from the source documents, and can't generate code, scripts, structured data formats, or fictional/roleplay content."
+    cached = get_cached_response(user_message) if cache_eligible else None
+    if cached:
+        raw_answer = cached["raw_answer"]
+        citations = cached["citations"]
+    else:
+        response_data = query_lex_oracle(user_message, doc_filter, history)
+        raw_answer = response_data.get("raw_answer", "Error generating response.")
+        citations = response_data.get("citations", [])
 
-    citations = response_data.get("citations", [])
+        # Guards against a blank AI answer (this can happen after a very
+        # short or unclear voice recording) reaching the person as an empty
+        # message instead of a real sentence.
+        if not raw_answer or not raw_answer.strip():
+            raw_answer = "I wasn't able to generate a response to that. Could you rephrase your question?"
+        elif contains_drift(raw_answer):
+            raw_answer = "I can only provide statutory legal information from the source documents, and can't generate code, scripts, structured data formats, or fictional/roleplay content."
+        elif cache_eligible:
+            # Only cache a clean, on-topic answer - never one that already
+            # tripped the empty-answer or drift fallback above.
+            set_cached_response(user_message, {"raw_answer": raw_answer, "citations": citations})
 
     final_answer = raw_answer
     if not _is_english_variant(target_lang):
