@@ -357,8 +357,10 @@ Rate limited to 15 requests per minute per person. Converts a recorded voice cli
 
 Request (multipart form data):
 
+```
 audio_file: file (required)
 target_lang: string (default "English (US)")
+```
 
 Successful response:
 
