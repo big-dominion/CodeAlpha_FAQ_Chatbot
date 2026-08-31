@@ -1239,12 +1239,13 @@ function addUserBubble(text){
   scrollToBottom();
 }
 
-/* Appends a right-aligned voice-message bubble (with its own inline
-   play/pause + progress bar, entirely local <audio> playback of the
-   ORIGINAL recorded blob - not anything returned by the backend) plus
-   the transcript main.py sent back as `data.user_message`. Called from
-   sendAudioMessage() after the /api/v1/chat response comes back, unlike
-   addUserBubble() which is called before the request. */
+/* Appends a right-aligned voice-message bubble IMMEDIATELY when the
+   person hits Send on their recording - before any network request has
+   even started. `transcribedText` is null at this point; a "Transcribing..."
+   placeholder is shown under the voice note until updateVoiceBubbleTranscript()
+   fills in the real transcript (or an error) once /api/v1/transcribe
+   responds. Returns `row` so the caller can pass it to
+   updateVoiceBubbleTranscript() later. */
 function addUserVoiceBubble(audioBlob, transcribedText){
   const row = document.createElement('div');
   row.className = 'chat-bubble-row flex justify-end';
@@ -1262,7 +1263,9 @@ function addUserVoiceBubble(audioBlob, transcribedText){
         </div>
         <i data-lucide="mic" class="w-3.5 h-3.5 text-silver flex-shrink-0"></i>
       </div>
-      ${transcribedText ? `<p class="text-[11px] text-parchment/60 italic mt-1.5 leading-snug">"${transcribedText.replace(/"/g, '&quot;')}"</p>` : ''}
+      <p class="voice-transcript-text text-[11px] text-parchment/60 italic mt-1.5 leading-snug">
+        ${transcribedText ? `"${transcribedText.replace(/"/g, '&quot;')}"` : 'Transcribing...'}
+      </p>
     </div>`;
 
   chatLog.appendChild(row);
@@ -1293,6 +1296,22 @@ function addUserVoiceBubble(audioBlob, transcribedText){
     fill.style.width = '0%';
     lucide.createIcons();
   });
+
+  return row;
+}
+
+/* Fills in a voice bubble's transcript once /api/v1/transcribe responds
+   (success or failure), replacing the "Transcribing..." placeholder set
+   by addUserVoiceBubble() above. */
+function updateVoiceBubbleTranscript(row, transcript, errorMsg){
+  const textEl = row.querySelector('.voice-transcript-text');
+  if (!textEl) return;
+  if (errorMsg) {
+    textEl.textContent = errorMsg;
+    textEl.classList.add('text-red-400/80');
+  } else {
+    textEl.textContent = `"${transcript}"`;
+  }
 }
 
 /* Appends a left-aligned assistant bubble. `text` is what's actually
@@ -1731,6 +1750,7 @@ micBtn.addEventListener('click', async () => {
       lucide.createIcons();
       clearInterval(recordingInterval);
       micStatus.classList.add('hidden');
+      document.getElementById('chat-input').disabled = false;
       // Recorded as WebM/Opus - this exact blob type is what
       // services/audio_handler.py's convert_to_wav() expects to receive
       // and decode with format="webm" once it's actually sent.
@@ -1741,13 +1761,14 @@ micBtn.addEventListener('click', async () => {
     };
 
     mediaRecorder.start();
+    document.getElementById('chat-input').disabled = true;
     micBtn.classList.add('mic-recording');
     micBtn.innerHTML = '<i data-lucide="square" class="w-4.5 h-4.5 text-red-400"></i>';
     lucide.createIcons();
 
     recordingStartTime = Date.now();
     micStatus.classList.remove('hidden');
-    micStatus.textContent = 'Recording 0:00 — tap the mic again to stop';
+    micStatus.textContent = 'Recording 0:00 - tap the mic again to stop';
     recordingInterval = setInterval(() => {
       micStatus.textContent = `Recording ${formatElapsed(Date.now() - recordingStartTime)} — tap the mic again to stop`;
     }, 500);
@@ -1784,30 +1805,68 @@ previewSendBtn.addEventListener('click', () => {
   sendAudioMessage(blobToSend);
 });
 
-/* THE voice-message send path - mirrors sendMessage() above but sends
-   `audio_file` instead of `text_input` in the form data, and (unlike
-   sendMessage(), which renders the user bubble BEFORE the request)
-   waits for the /api/v1/chat response before rendering ANY bubble at
-   all, since it needs main.py's transcript (`data.user_message`) to
-   pass to addUserVoiceBubble(). */
+/* THE voice-message send path, now split into two steps so the user's
+   own voice note (and its transcript) appear right away instead of only
+   after the full RAG+Groq round trip finishes:
+
+   1. Show the voice bubble IMMEDIATELY (with a "Transcribing..."
+      placeholder), then POST just the audio to /api/v1/transcribe -
+      cheap and fast, no Pinecone/Groq involved. Fill in the real
+      transcript as soon as that responds.
+   2. Once the transcript is known, show the typing indicator and call
+      /api/v1/chat as an ordinary TEXT message (text_input = transcript),
+      exactly like sendMessage() does - this reuses chat_endpoint's
+      existing text path instead of its separate audio_file path, since
+      transcription has already happened here.
+
+   A basic size check guards against sending an empty/near-empty blob at
+   all (e.g. from the double-recording race this replaces protection
+   for), matching the corrupted-audio 400s seen in production logs. */
 async function sendAudioMessage(audioBlob){
+  if (!audioBlob || audioBlob.size < 100) {
+    addAssistantBubble("That recording seemed too short or empty. Please try again.", null, []);
+    return;
+  }
+
   const targetLang = document.getElementById('lang-current').textContent.trim();
   const activeFilter = document.querySelector('.filter-chip.active').dataset.filter;
 
+  const voiceBubbleRow = addUserVoiceBubble(audioBlob, null);
+
+  const transcribeFormData = new FormData();
+  transcribeFormData.append("audio_file", audioBlob, "recording.webm");
+  transcribeFormData.append("target_lang", targetLang);
+
+  let transcript;
+  try {
+    const transcribeRes = await fetch('/api/v1/transcribe', { method: 'POST', body: transcribeFormData });
+    if (!transcribeRes.ok) {
+      const err = await transcribeRes.json().catch(() => null);
+      updateVoiceBubbleTranscript(voiceBubbleRow, null, err?.detail || "Could not transcribe recording");
+      return;
+    }
+    const data = await transcribeRes.json();
+    transcript = data.transcript;
+    updateVoiceBubbleTranscript(voiceBubbleRow, transcript);
+  } catch (err) {
+    console.error("Transcription request failed:", err);
+    updateVoiceBubbleTranscript(voiceBubbleRow, null, "Connection error while transcribing");
+    return;
+  }
+
   showTyping();
-  const formData = new FormData();
-  formData.append("session_id", sessionId);
-  formData.append("audio_file", audioBlob, "recording.webm");
-  formData.append("target_lang", targetLang);
-  formData.append("doc_filter", activeFilter);
+  const chatFormData = new FormData();
+  chatFormData.append("session_id", sessionId);
+  chatFormData.append("text_input", transcript);
+  chatFormData.append("target_lang", targetLang);
+  chatFormData.append("doc_filter", activeFilter);
 
   try {
-    const response = await fetch('/api/v1/chat', { method: 'POST', body: formData });
-    if(!response.ok) throw new Error("Network error communicating with gateway.");
+    const response = await fetch('/api/v1/chat', { method: 'POST', body: chatFormData });
+    if (!response.ok) throw new Error("Network error communicating with gateway.");
     const data = await response.json();
     sessionId = data.session_id;
     removeTyping();
-    addUserVoiceBubble(audioBlob, data.user_message);
     addAssistantBubble(data.response_text, data.raw_answer, data.citations, targetLang);
   } catch (error) {
     console.error("Backend API Error:", error);

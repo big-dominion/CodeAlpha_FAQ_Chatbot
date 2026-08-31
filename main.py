@@ -477,6 +477,45 @@ async def chat_endpoint(
     }
 
 
+@app.post("/api/v1/transcribe")
+@limiter.limit("15/minute")
+async def transcribe_endpoint(request: Request, audio_file: UploadFile = File(...), target_lang: str = Form("English (US)")):
+    """
+    Transcribes a recorded voice clip to text ONLY - no RAG, no Groq
+    answer generation. Exists so the frontend can show the user's own
+    voice note and its transcript immediately after sending, instead of
+    waiting for the full chat_endpoint round trip (STT + Pinecone + Groq)
+    to finish before showing anything at all. The frontend calls this
+    first, then calls chat_endpoint separately with the resulting
+    transcript as text_input - see index.html's sendAudioMessage().
+
+    Detailed flow:
+    - Read the uploaded audio bytes and run them through
+      speech_to_text_from_bytes, using target_lang for locale-correct
+      recognition, same as chat_endpoint's audio path did before.
+    - If transcription raises (corrupted audio, unsupported format,
+      empty recording), return a 400 with the error detail rather than
+      letting an unhandled exception surface as a generic 500 - this is
+      exactly the failure mode seen in production logs where a
+      malformed WebM blob caused ffmpeg to fail; this endpoint now
+      reports that clearly instead of chat_endpoint doing so deep inside
+      a combined request.
+    - On success, return just the transcript - this endpoint does not
+      touch chat_sessions, query_lex_oracle, or the cache at all.
+    """
+    audio_bytes = await audio_file.read()
+    try:
+        transcript = speech_to_text_from_bytes(audio_bytes, lang=target_lang)
+    except Exception as e:
+        logger.warning(f"Transcription failed: {e}")
+        return JSONResponse({"detail": "Could not transcribe that recording. Please try again."}, status_code=400)
+
+    if not transcript or not transcript.strip():
+        return JSONResponse({"detail": "No speech detected in that recording."}, status_code=400)
+
+    return {"transcript": transcript}
+
+
 # Request body shape for POST /api/v1/tts - a plain FastAPI/pydantic model
 # so the framework validates and parses the incoming JSON automatically.
 class TTSRequest(BaseModel):
