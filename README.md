@@ -134,12 +134,14 @@ CodeAlpha_FAQ_Chatbot/
 |       |-- dompurify-3.1.6.js
 |       |-- lucide-0.460.0.js
 |       |-- marked-12.0.2.js
-|   |-- index.html
-|   |-- logo.avif
-|   |-- logo.png
-|   |-- source-links.json
+|   |-- index.html               [The entire frontend - layout, styling, and all JavaScript, in one file]
+|   |-- logo.avif                [Main logo format - smaller file size, modern compression]
+|   |-- logo.png                 [Fallback logo for browsers that don't support AVIF rendering]
+|   |-- source-links.json        [Lets users verify citations against the original PDFs]
 |
 |-- cache.py                     [Bounded in-memory response cache for repeated questions]
+|-- cloud_index.py               [MAINTENANCE - one-time Pinecone index creation]
+|-- ingest.py                    [MAINTENANCE - reads PDFs, chunks, embeds, and upserts into Pinecone]
 |-- main.py
 |-- measure_data.py             [DEVELOPMENT ONLY - checks how well the section splitting regex is working]
 |-- pyproject.toml               [Lists the project's dependencies, used by uv]
@@ -166,6 +168,19 @@ A closer look at what each one actually does:
 - **static/index.html**: The entire user interface. This one file contains the layout, the styling, and all the JavaScript that talks to the backend. There is no separate frontend build step.
 - **static/logo.png / logo.avif**: The app's logo image, shown on the welcome screen and in the header.
 - **static/source-links.json**: A small file that maps each law's short name (like CAMA_2020) to a link where the person can read the full original document.
+
+  Current mappings:
+```json
+  {
+    "CAMA_2020": "https://drive.google.com/file/d/1FTvkBZlPJhHjsat4tJubVy-V6-yaKb6s/view?usp=sharing",
+    "ACJA_2015": "https://drive.google.com/file/d/1uy4DTcxI_XFwf78A-iY_O15kAnVWwZ9l/view?usp=sharing",
+    "CONSTITUTION_1999": "https://drive.google.com/file/d/1DRLa4AfQ6rGbL2lp8FRgD-QDdsh7XeFl/view?usp=sharing",
+    "EVIDENCE_ACT": "https://drive.google.com/file/d/1DG_5Q_A-DaaI9xthxmLA7Ony8iOv7duA/view?usp=sharing",
+    "CRIMINAL_CODE": "https://drive.google.com/file/d/1O-IJjeI2fFbSg1EjNJJrbGonk-hHUwEL/view?usp=sharing",
+    "PENAL_CODE": "https://drive.google.com/file/d/1CgvYRFgc3nLhCgNPeo-01C5pZZfVK6AR/view?usp=sharing"
+  }
+```
+
 - **static/vendor/**: Self-hosted copies of Lucide, Marked, and DOMPurify, pinned to specific versions, so the frontend doesn't depend on a third-party CDN being reachable at runtime.
 - **cache.py**: A small, bounded LRU cache that stores the answer to a session's opening question, so if many different users ask the same common question during a traffic spike, only the first one actually triggers a full search-and-generate cycle - everyone after that gets served from cache instantly. Capped at 500 entries with a 20 minute expiry, so memory use can never grow without bound no matter how much traffic arrives.
 
