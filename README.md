@@ -138,7 +138,10 @@ CodeAlpha_FAQ_Chatbot/
 |   |-- logo.avif                [Main logo format - smaller file size, modern compression]
 |   |-- logo.png                 [Fallback logo for browsers that don't support AVIF rendering]
 |   |-- source-links.json        [Lets users verify citations against the original PDFs]
-|
+|-- .env                        [Holds your actual secret API keys - never committed]
+|-- .env.example                [Template showing which env vars to set, with safe defaults filled in]
+|-- .gitignore                  [Files and folders Git should never track]
+|-- .python-version             [Tells uv which exact Python version this project expects]
 |-- cache.py                     [Bounded in-memory response cache for repeated questions]
 |-- cloud_index.py               [MAINTENANCE - one-time Pinecone index creation]
 |-- ingest.py                    [MAINTENANCE - reads PDFs, chunks, embeds, and upserts into Pinecone]
@@ -204,6 +207,7 @@ These were used while building and testing the ingestion process. The live app n
 ### Configuration and dependency files
 
 - **.env**: Holds your actual secret API keys. This file is never uploaded to GitHub, it stays only on your own machine, or for a deployed app, is entered directly into Render's settings instead.
+- **.env.example**: A template showing every environment variable the app uses, with safe defaults already filled in (like `PINECONE_INDEX_NAME=lexoracle-cloud` and `GROQ_MODEL=openai/gpt-oss-120b`) and secret keys left blank. Copy this to `.env` and fill in your own `PINECONE_API_KEY` and `GROQ_API_KEY`.
 - **.gitignore**: A list of files and folders that Git should never track or upload, such as .env, the virtual environment folder, and cached Python files.
 - **.python-version**: Tells uv which exact Python version this project expects (3.12).
 - **pyproject.toml**: The main list of what packages this project depends on, used by uv to set up the environment.
